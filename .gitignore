@@ -46,7 +46,7 @@ next-env.d.ts
 db/
 *.db
 
-# z.ai specific (not part of NebChat)
+# z.ai sandbox files (not part of NebChat)
 .zscripts/
 skills/
 mini-services/
