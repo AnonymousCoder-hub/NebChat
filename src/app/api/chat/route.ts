@@ -1,146 +1,144 @@
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-export async function POST(request: NextRequest) {
+export async function POST(req: NextRequest) {
   try {
-    const body = await request.json();
+    const body = await req.json();
     const {
       messages,
       model,
       baseUrl,
       apiKey,
       stream = true,
-      temperature = 0.7,
-      max_tokens = 4096,
-      thinkingEnabled = true,
+      temperature,
+      max_tokens,
+      thinkingEnabled,
       searchResults,
-      searchEnabled = false,
+      systemPrompt,
     } = body;
 
-    if (!baseUrl || !apiKey || !model) {
-      return new Response(
-        JSON.stringify({ error: "Missing required fields: baseUrl, apiKey, model" }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
+    if (!baseUrl || !model) {
+      return NextResponse.json(
+        { error: "Base URL and model are required" },
+        { status: 400 }
       );
+    }
+
+    // Build messages array with proper context
+    const processedMessages: { role: string; content: string }[] = [];
+
+    // Add system prompt if provided
+    if (systemPrompt) {
+      processedMessages.push({ role: "system", content: systemPrompt });
+    }
+
+    // Process history messages
+    for (const msg of messages) {
+      // Skip system messages from history (we handle system prompt separately)
+      if (msg.role === "system") continue;
+
+      let content = msg.content || "";
+
+      // Strip <think...> tags from history if thinking is disabled
+      if (!thinkingEnabled) {
+        content = content.replace(/<think[^>]*>[\s\S]*?<\/think>/g, "").trim();
+      }
+
+      if (content) {
+        processedMessages.push({ role: msg.role, content });
+      }
+    }
+
+    // If search results are provided, inject them as a context message
+    // BEFORE the last user message, as a separate system context
+    if (searchResults && searchResults.length > 0) {
+      const lastUserIdx = processedMessages.map(m => m.role).lastIndexOf("user");
+      if (lastUserIdx !== -1) {
+        const searchContext = buildSearchContext(searchResults);
+        // Insert search context right before the last user message
+        processedMessages.splice(lastUserIdx, 0, {
+          role: "system",
+          content: searchContext,
+        });
+      }
     }
 
     // Normalize base URL
-    const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
-    const url = `${normalizedBaseUrl}/v1/chat/completions`;
+    let normalizedUrl = baseUrl.replace(/\/+$/, "");
 
-    // Build messages array - inject search results if provided
-    const processedMessages = [...messages];
-
-    if (searchResults && searchResults.length > 0) {
-      // Inject search results as a system context message BEFORE the last user message
-      // This keeps the conversation clean and doesn't pollute user messages
-      const searchContext = searchResults
-        .slice(0, 10) // Max 10 results to keep context manageable
-        .map((r: { title: string; url: string; snippet: string; content?: string }, i: number) => {
-          // If we have page content, include a condensed version
-          if (r.content && r.content.length > 100) {
-            // Take first 1500 chars of content (reduced from 8000 for chat mode)
-            const condensed = r.content.length > 1500 ? r.content.slice(0, 1500) + "..." : r.content;
-            return `[${i + 1}] ${r.title}\nURL: ${r.url}\nContent: ${condensed}`;
-          }
-          return `[${i + 1}] ${r.title}\nURL: ${r.url}\n${r.snippet}`;
-        })
-        .join("\n\n");
-
-      // Find the last user message and prepend search context
-      const lastUserIdx = processedMessages.map((m: { role: string }) => m.role).lastIndexOf("user");
-      if (lastUserIdx !== -1) {
-        const originalContent = processedMessages[lastUserIdx].content;
-        processedMessages[lastUserIdx] = {
-          ...processedMessages[lastUserIdx],
-          content: `I searched the web for you. Here are the relevant results:\n\n${searchContext}\n\n---\n\nBased on the above web search results, provide a comprehensive and accurate answer. Cite sources by number [1], [2], etc. when referencing information. If the search results don't fully answer the question, provide what you can and note any gaps.\n\nUser's question: ${originalContent}`,
-        };
-      }
-    }
-
-    // Build payload with thinking control
-    const payload: Record<string, unknown> = {
+    // Build request body for OpenAI-compatible API
+    const requestBody: Record<string, unknown> = {
       model,
       messages: processedMessages,
       stream,
-      temperature,
-      max_tokens,
     };
 
-    // Thinking control via API parameters:
-    //
-    // `reasoning_effort`: for Ollama's OpenAI-compatible endpoint (/v1/chat/completions)
-    //   - "none" = disable thinking, "low"/"medium"/"high" = enable with effort level
-    //   - Works across all models (qwen3, gemma4, deepseek-r1, etc.)
-    //
-    // `think`: for Ollama's native API (/api/chat)
-    //   - true/false toggle for thinking
-    //
-    // Both params are safely ignored by non-Ollama providers (OpenAI, Groq, etc.)
-    //
-    // NOTE: We do NOT use /no_think tags in the prompt because they are
-    // qwen3-specific — other models like gemma4 treat them as literal text
-    // and respond to them, which breaks the conversation.
-    if (!thinkingEnabled) {
-      // Strip any <think...</think...> tags from message history so the model
-      // doesn't see old thinking and continue the pattern
-      payload.messages = processedMessages.map((m: { role: string; content: string }) => ({
-        role: m.role,
-        content: m.content.replace(/<think[\s\/]*>[\s\S]*?<\/think>\s*/g, ""),
-      }));
+    if (temperature !== undefined) requestBody.temperature = temperature;
+    if (max_tokens !== undefined) requestBody.max_tokens = max_tokens;
 
-      payload.reasoning_effort = "none";
-      payload.think = false;
-    } else {
-      payload.reasoning_effort = "high";
-      payload.think = true;
+    // Add thinking/reasoning parameters for supported models
+    if (thinkingEnabled) {
+      // Ollama reasoning effort
+      requestBody.reasoning_effort = "high";
+      // Some providers use different parameter names
+      if (normalizedUrl.includes("ollama") || normalizedUrl.includes("127.0.0.1") || normalizedUrl.includes("localhost") || normalizedUrl.includes("ngrok")) {
+        // Ollama-specific: add think parameter
+        // The think parameter is handled via the chat template in Ollama
+        // No extra param needed for /v1/chat/completions
+      }
     }
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
+    // Determine the API endpoint
+    const endpoint = `${normalizedUrl}/v1/chat/completions`;
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      let errorMessage: string;
-      try {
-        const errorJson = JSON.parse(errorText);
-        errorMessage = errorJson.error?.message || errorJson.message || errorText;
-      } catch {
-        errorMessage = errorText;
-      }
-      return new Response(
-        JSON.stringify({ error: errorMessage }),
-        { status: response.status, headers: { "Content-Type": "application/json" } }
-      );
+    // Set up headers
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (apiKey && apiKey !== "ollama" && apiKey !== "none") {
+      headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
     if (stream) {
-      const reader = response.body?.getReader();
-      if (!reader) {
-        return new Response(
-          JSON.stringify({ error: "No response body" }),
-          { status: 500, headers: { "Content-Type": "application/json" } }
+      // Stream the response
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(300000), // 5 min timeout for long responses
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "Unknown error");
+        return NextResponse.json(
+          { error: `LLM API error: ${response.status} - ${errorText.slice(0, 500)}` },
+          { status: response.status }
         );
       }
 
+      // Stream the SSE response through
       const stream = new ReadableStream({
         async start(controller) {
+          const reader = response.body?.getReader();
+          if (!reader) {
+            controller.close();
+            return;
+          }
+
+          const decoder = new TextDecoder();
           try {
             while (true) {
               const { done, value } = await reader.read();
-              if (done) {
-                controller.close();
-                break;
-              }
-              controller.enqueue(value);
+              if (done) break;
+
+              const chunk = decoder.decode(value, { stream: true });
+              controller.enqueue(new TextEncoder().encode(chunk));
             }
-          } catch (error) {
-            controller.error(error);
+          } catch (err) {
+            // Client disconnected - that's fine
+            console.error("Stream error:", err);
+          } finally {
+            controller.close();
+            reader.releaseLock();
           }
         },
       });
@@ -149,20 +147,58 @@ export async function POST(request: NextRequest) {
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
-          Connection: "keep-alive",
         },
       });
     } else {
-      const data = await response.json();
-      return new Response(JSON.stringify(data), {
-        headers: { "Content-Type": "application/json" },
+      // Non-streaming request
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(300000),
       });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "Unknown error");
+        return NextResponse.json(
+          { error: `LLM API error: ${response.status} - ${errorText.slice(0, 500)}` },
+          { status: response.status }
+        );
+      }
+
+      const data = await response.json();
+      return NextResponse.json(data);
     }
   } catch (error) {
     console.error("Chat API error:", error);
-    return new Response(
-      JSON.stringify({ error: "Internal server error" }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+/**
+ * Build a search context message that gives the AI full awareness of search results
+ */
+function buildSearchContext(
+  results: { title: string; url: string; snippet: string; content?: string }[]
+): string {
+  let context = `[WEB SEARCH RESULTS]\nThe following are web search results relevant to the user's query. Use this information to provide an accurate, up-to-date response. Cite sources by referencing the URL when using specific information.\n\n`;
+
+  results.forEach((result, i) => {
+    context += `--- Source ${i + 1}: ${result.title} ---\n`;
+    context += `URL: ${result.url}\n`;
+    if (result.content) {
+      // Truncate long content to avoid overwhelming the context
+      const maxContent = 2000;
+      context += result.content.length > maxContent
+        ? result.content.slice(0, maxContent) + "..."
+        : result.content;
+    } else {
+      context += result.snippet;
+    }
+    context += "\n\n";
+  });
+
+  context += `---\nUse the above search results to inform your response. Always cite the URL when referencing specific information from the sources. Do not mention "search results" or "the search" - just naturally incorporate the information.`;
+  return context;
 }

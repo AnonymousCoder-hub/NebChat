@@ -1,88 +1,110 @@
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-export async function POST(request: NextRequest) {
+export async function GET(req: NextRequest) {
   try {
-    const body = await request.json();
-    const { baseUrl, apiKey } = body;
+    const { searchParams } = new URL(req.url);
+    const baseUrl = searchParams.get("baseUrl") || "";
+    const apiKey = searchParams.get("apiKey") || "";
 
     if (!baseUrl) {
-      return new Response(
-        JSON.stringify({ error: "Missing required field: baseUrl" }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
+      return NextResponse.json(
+        { error: "Base URL is required" },
+        { status: 400 }
       );
     }
 
-    // Normalize base URL
-    const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
-    
-    // Try different model endpoints
-    const endpoints = [
-      `${normalizedBaseUrl}/v1/models`,
-      `${normalizedBaseUrl}/models`,
-    ];
-
-    let lastError: string | null = null;
-
-    for (const url of endpoints) {
-      try {
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-        };
-        
-        if (apiKey) {
-          headers["Authorization"] = `Bearer ${apiKey}`;
-        }
-
-        const response = await fetch(url, {
-          method: "GET",
-          headers,
-          signal: AbortSignal.timeout(10000), // 10 second timeout
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          
-          // Handle different response formats
-          let models = [];
-          if (Array.isArray(data)) {
-            models = data;
-          } else if (data.data && Array.isArray(data.data)) {
-            models = data.data;
-          } else if (data.models && Array.isArray(data.models)) {
-            models = data.models;
-          }
-
-          // Normalize model format
-          const normalizedModels = models.map((m: Record<string, unknown>) => ({
-            id: m.id || m.name || m.model || "",
-            name: m.name || m.id || m.model || "",
-            object: m.object || "model",
-            owned_by: m.owned_by || m.owner || "",
-          })).filter((m: { id: string }) => m.id);
-
-          return new Response(
-            JSON.stringify({ data: normalizedModels }),
-            { headers: { "Content-Type": "application/json" } }
-          );
-        } else {
-          const errorText = await response.text().catch(() => "Unknown error");
-          lastError = `HTTP ${response.status}: ${errorText}`;
-        }
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : "Unknown error";
-        continue;
-      }
+    const normalizedUrl = baseUrl.replace(/\/+$/, "");
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+    };
+    if (apiKey && apiKey !== "ollama" && apiKey !== "none") {
+      headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    return new Response(
-      JSON.stringify({ error: lastError || "Could not fetch models from any endpoint" }),
-      { status: 502, headers: { "Content-Type": "application/json" } }
+    // Try /v1/models first (OpenAI-compatible)
+    const models = await tryFetchModels(
+      `${normalizedUrl}/v1/models`,
+      headers
+    );
+
+    if (models) {
+      return NextResponse.json(models);
+    }
+
+    // Fallback: try /models (some providers)
+    const modelsFallback = await tryFetchModels(
+      `${normalizedUrl}/models`,
+      headers
+    );
+
+    if (modelsFallback) {
+      return NextResponse.json(modelsFallback);
+    }
+
+    return NextResponse.json(
+      { error: "Could not fetch models from the provided URL" },
+      { status: 400 }
     );
   } catch (error) {
     console.error("Models API error:", error);
-    return new Response(
-      JSON.stringify({ error: "Internal server error" }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+async function tryFetchModels(
+  url: string,
+  headers: Record<string, string>
+): Promise<unknown> {
+  try {
+    const response = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+
+    // Normalize different response formats
+    // OpenAI format: { data: [...] }
+    // Ollama format: { models: [...] }
+    // Some: direct array
+    if (Array.isArray(data)) {
+      return { object: "list", data: normalizeModels(data) };
+    }
+    if (data.data && Array.isArray(data.data)) {
+      return { object: "list", data: normalizeModels(data.data) };
+    }
+    if (data.models && Array.isArray(data.models)) {
+      return {
+        object: "list",
+        data: normalizeModels(
+          data.models.map(
+            (m: { id?: string; name?: string; model?: string; owned_by?: string; provider?: string }) => ({
+              id: m.id || m.name || m.model,
+              object: "model",
+              created: Date.now(),
+              owned_by: m.owned_by || m.provider || "unknown",
+            })
+          )
+        ),
+      };
+    }
+
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeModels(
+  models: { id?: string; name?: string; object?: string; created?: number; owned_by?: string }[]
+) {
+  return models.map((m) => ({
+    id: m.id || m.name || "unknown",
+    object: m.object || "model",
+    created: m.created || Date.now(),
+    owned_by: m.owned_by || "unknown",
+  }));
 }

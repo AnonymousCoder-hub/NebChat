@@ -1,276 +1,293 @@
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-export async function POST(request: NextRequest) {
+// ============================================================
+// Search API — Multi-provider search with page reading
+// ============================================================
+
+export async function GET(req: NextRequest) {
   try {
-    const body = await request.json();
-    const { query, provider, maxResults = 5, fetchContent = false, contentPages = 3, pageReaderUrl } = body;
+    const { searchParams } = new URL(req.url);
+    const query = searchParams.get("q");
+    const providerType = searchParams.get("type") || "duckduckgo";
+    const providerUrl = searchParams.get("url") || "";
+    const apiKey = searchParams.get("apiKey") || "";
+    const cxId = searchParams.get("cxId") || "";
+    const maxResults = parseInt(searchParams.get("maxResults") || "8");
+    const pageReaderUrl = searchParams.get("pageReaderUrl") || "";
+    const readPages = searchParams.get("readPages") === "true";
 
-    if (!query || !provider) {
-      return new Response(
-        JSON.stringify({ error: "Missing required fields: query, provider" }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
+    if (!query) {
+      return NextResponse.json(
+        { error: "Query parameter 'q' is required" },
+        { status: 400 }
       );
     }
 
-    const { type, baseUrl, apiKey, cxId } = provider;
-
     let results: { title: string; url: string; snippet: string; content?: string }[] = [];
 
-    switch (type) {
-      case "duckduckgo": {
-        if (!baseUrl) {
-          return new Response(
-            JSON.stringify({ error: "DuckDuckGo requires a base URL (your Colab proxy URL)" }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        // DuckDuckGo search via the Colab unified proxy
-        const searchUrl = `${baseUrl.replace(/\/+$/, "")}/search?q=${encodeURIComponent(query)}&max_results=${maxResults}`;
-        
-        const response = await fetch(searchUrl, {
-          headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-          signal: AbortSignal.timeout(15000),
-        });
-        
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({ error: `DuckDuckGo proxy returned ${response.status}` }));
-          throw new Error(errorData.error || `DuckDuckGo proxy returned ${response.status}`);
-        }
-        const data = await response.json();
-        results = (data.results || []).slice(0, maxResults).map((r: Record<string, unknown>) => ({
-          title: String(r.title || ""),
-          url: String(r.url || ""),
-          snippet: String(r.content || ""),
-        }));
+    switch (providerType) {
+      case "duckduckgo":
+        results = await searchDuckDuckGo(query, providerUrl, maxResults);
         break;
-      }
-
-      case "searxng": {
-        if (!baseUrl) {
-          return new Response(
-            JSON.stringify({ error: "SearXNG requires a base URL" }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        const searchUrl = `${baseUrl.replace(/\/+$/, "")}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
-        
-        // Retry logic for SearXNG (503 = service not ready yet)
-        let response: Response | null = null;
-        const maxRetries = 3;
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-          try {
-            response = await fetch(searchUrl, {
-              headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-              signal: AbortSignal.timeout(15000),
-            });
-            if (response.ok) break;
-            if (response.status === 503 && attempt < maxRetries - 1) {
-              // SearXNG not ready, wait and retry
-              await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
-              continue;
-            }
-          } catch (fetchError) {
-            if (attempt < maxRetries - 1) {
-              await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
-              continue;
-            }
-            throw fetchError;
-          }
-        }
-        
-        if (!response || !response.ok) {
-          const status = response?.status || 0;
-          if (status === 503) {
-            throw new Error("SearXNG is unavailable (503). Make sure SearXNG Docker container is running in your Colab. Check the Colab output for errors.");
-          }
-          throw new Error(`SearXNG returned ${status}`);
-        }
-        const data = await response.json();
-        results = (data.results || []).slice(0, maxResults).map((r: Record<string, unknown>) => ({
-          title: String(r.title || ""),
-          url: String(r.url || ""),
-          snippet: String(r.content || ""),
-        }));
+      case "searxng":
+        results = await searchSearXNG(query, providerUrl, maxResults);
         break;
-      }
-
-      case "brave": {
-        if (!apiKey) {
-          return new Response(
-            JSON.stringify({ error: "Brave Search requires an API key" }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        const response = await fetch(
-          `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${maxResults}`,
-          {
-            headers: {
-              "X-Subscription-Token": apiKey,
-              Accept: "application/json",
-            },
-            signal: AbortSignal.timeout(15000),
-          }
-        );
-        if (!response.ok) {
-          throw new Error(`Brave Search returned ${response.status}`);
-        }
-        const data = await response.json();
-        results = (data.web?.results || []).map((r: Record<string, unknown>) => ({
-          title: String(r.title || ""),
-          url: String(r.url || ""),
-          snippet: String(r.description || ""),
-        }));
+      case "brave":
+        results = await searchBrave(query, apiKey, maxResults);
         break;
-      }
-
-      case "serper": {
-        if (!apiKey) {
-          return new Response(
-            JSON.stringify({ error: "Serper requires an API key" }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        const response = await fetch("https://google.serper.dev/search", {
-          method: "POST",
-          headers: {
-            "X-API-KEY": apiKey,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ q: query, num: maxResults }),
-          signal: AbortSignal.timeout(15000),
-        });
-        if (!response.ok) {
-          throw new Error(`Serper returned ${response.status}`);
-        }
-        const data = await response.json();
-        results = (data.organic || []).map((r: Record<string, unknown>) => ({
-          title: String(r.title || ""),
-          url: String(r.link || ""),
-          snippet: String(r.snippet || ""),
-        }));
+      case "serper":
+        results = await searchSerper(query, apiKey, maxResults);
         break;
-      }
-
-      case "tavily": {
-        if (!apiKey) {
-          return new Response(
-            JSON.stringify({ error: "Tavily requires an API key" }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        const response = await fetch("https://api.tavily.com/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query,
-            api_key: apiKey,
-            max_results: maxResults,
-            include_answer: false,
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-        if (!response.ok) {
-          throw new Error(`Tavily returned ${response.status}`);
-        }
-        const data = await response.json();
-        results = (data.results || []).map((r: Record<string, unknown>) => ({
-          title: String(r.title || ""),
-          url: String(r.url || ""),
-          snippet: String(r.content || ""),
-        }));
+      case "tavily":
+        results = await searchTavily(query, apiKey, maxResults);
         break;
-      }
-
-      case "google_cse": {
-        if (!apiKey || !cxId) {
-          return new Response(
-            JSON.stringify({ error: "Google CSE requires an API key and CX ID" }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        const response = await fetch(
-          `https://www.googleapis.com/customsearch/v1?q=${encodeURIComponent(query)}&key=${apiKey}&cx=${cxId}&num=${maxResults}`,
-          { signal: AbortSignal.timeout(15000) }
-        );
-        if (!response.ok) {
-          throw new Error(`Google CSE returned ${response.status}`);
-        }
-        const data = await response.json();
-        results = (data.items || []).map((r: Record<string, unknown>) => ({
-          title: String(r.title || ""),
-          url: String(r.link || ""),
-          snippet: String(r.snippet || ""),
-        }));
+      case "google_cse":
+        results = await searchGoogleCSE(query, apiKey, cxId, maxResults);
         break;
-      }
-
       default:
-        return new Response(
-          JSON.stringify({ error: `Unknown search provider type: ${type}` }),
-          { status: 400, headers: { "Content-Type": "application/json" } }
+        return NextResponse.json(
+          { error: `Unknown search provider type: ${providerType}` },
+          { status: 400 }
         );
     }
 
-    // --- FETCH FULL PAGE CONTENT ---
-    // After getting search results, read the top pages
-    // If Crawl4AI is configured, use it; otherwise fall back to Jina Reader
-    if (fetchContent && results.length > 0) {
-      const pagesToFetch = Math.min(contentPages, results.length, 3); // Cap at 3 pages max
-      const fetchPromises = results.slice(0, pagesToFetch).map(async (result, i) => {
+    // Read top pages if requested
+    if (readPages && pageReaderUrl && results.length > 0) {
+      const topResults = results.slice(0, 3);
+      const readPromises = topResults.map(async (result) => {
         try {
-          if (pageReaderUrl) {
-            // Use Crawl4AI
-            const crawlUrl = `${pageReaderUrl.replace(/\/+$/, "")}/crawl`;
-            const crawlResponse = await fetch(crawlUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ url: result.url }),
-              signal: AbortSignal.timeout(15000),
-            });
-            if (crawlResponse.ok) {
-              const crawlData = await crawlResponse.json();
-              const markdown = crawlData?.content?.markdown || "";
-              if (markdown) {
-                // Truncate to 2000 chars per page to keep context manageable
-                const truncated = markdown.length > 2000 ? markdown.slice(0, 2000) + "\n...(truncated)" : markdown;
-                results[i] = { ...result, content: truncated };
-                return;
-              }
-            }
-            // Crawl4AI failed, fall through to Jina Reader
+          const pageContent = await readPage(result.url, pageReaderUrl);
+          if (pageContent) {
+            result.content = pageContent.slice(0, 3000);
           }
-          // Fallback: Jina Reader (https://r.jina.ai) — free, no API key
-          const jinaUrl = `https://r.jina.ai/${encodeURIComponent(result.url)}`;
-          const pageResponse = await fetch(jinaUrl, {
-            headers: {
-              Accept: "text/plain",
-            },
-            signal: AbortSignal.timeout(10000),
-          });
-          if (pageResponse.ok) {
-            const text = await pageResponse.text();
-            // Truncate to 2000 chars per page
-            const truncated = text.length > 2000 ? text.slice(0, 2000) + "\n...(truncated)" : text;
-            results[i] = { ...result, content: truncated };
-          }
-          // If fetch fails, just keep the snippet — don't block other results
         } catch {
-          // Page read failed, keep snippet only
+          // Page reading failed, that's okay
         }
+        return result;
       });
 
-      await Promise.allSettled(fetchPromises);
+      await Promise.allSettled(readPromises);
     }
 
-    return new Response(
-      JSON.stringify({ results }),
-      { headers: { "Content-Type": "application/json" } }
-    );
+    return NextResponse.json({ results, query, provider: providerType });
   } catch (error) {
     console.error("Search API error:", error);
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : "Internal server error" }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
+    const message = error instanceof Error ? error.message : "Search failed";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+// --- DuckDuckGo via Colab proxy (Jina AI + DDG fallback) ---
+async function searchDuckDuckGo(
+  query: string,
+  proxyUrl: string,
+  maxResults: number
+) {
+  if (!proxyUrl) {
+    throw new Error("DuckDuckGo search requires a proxy URL (Colab bridge URL)");
+  }
+
+  const url = `${proxyUrl.replace(/\/+$/, "")}/search?q=${encodeURIComponent(query)}&max_results=${maxResults}`;
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Search proxy error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return (data.results || []).map(
+    (r: { title?: string; url?: string; content?: string; href?: string; body?: string }) => ({
+      title: r.title || "",
+      url: r.url || r.href || "",
+      snippet: r.content || r.body || "",
+    })
+  );
+}
+
+// --- SearXNG ---
+async function searchSearXNG(
+  query: string,
+  baseUrl: string,
+  maxResults: number
+) {
+  if (!baseUrl) {
+    throw new Error("SearXNG requires a base URL");
+  }
+
+  const url = `${baseUrl.replace(/\/+$/, "")}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
+
+  // Retry logic for SearXNG (may return 503 if not ready)
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (response.status === 503) {
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(`SearXNG error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return (data.results || [])
+        .slice(0, maxResults)
+        .map(
+          (r: { title?: string; url?: string; content?: string; snippet?: string }) => ({
+            title: r.title || "",
+            url: r.url || "",
+            snippet: r.content || r.snippet || "",
+          })
+        );
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error("Unknown error");
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+
+  throw lastError || new Error("SearXNG search failed after retries");
+}
+
+// --- Brave Search ---
+async function searchBrave(query: string, apiKey: string, maxResults: number) {
+  if (!apiKey) throw new Error("Brave Search requires an API key");
+
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${maxResults}`;
+  const response = await fetch(url, {
+    headers: {
+      "X-Subscription-Token": apiKey,
+      Accept: "application/json",
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) throw new Error(`Brave Search error: ${response.status}`);
+
+  const data = await response.json();
+  return (data.web?.results || []).map(
+    (r: { title?: string; url?: string; description?: string }) => ({
+      title: r.title || "",
+      url: r.url || "",
+      snippet: r.description || "",
+    })
+  );
+}
+
+// --- Serper.dev ---
+async function searchSerper(query: string, apiKey: string, maxResults: number) {
+  if (!apiKey) throw new Error("Serper requires an API key");
+
+  const response = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: {
+      "X-API-KEY": apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ q: query, num: maxResults }),
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) throw new Error(`Serper error: ${response.status}`);
+
+  const data = await response.json();
+  return (data.organic || []).map(
+    (r: { title?: string; link?: string; snippet?: string }) => ({
+      title: r.title || "",
+      url: r.link || "",
+      snippet: r.snippet || "",
+    })
+  );
+}
+
+// --- Tavily ---
+async function searchTavily(query: string, apiKey: string, maxResults: number) {
+  if (!apiKey) throw new Error("Tavily requires an API key");
+
+  const response = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      api_key: apiKey,
+      query,
+      max_results: maxResults,
+      include_answer: false,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!response.ok) throw new Error(`Tavily error: ${response.status}`);
+
+  const data = await response.json();
+  return (data.results || []).map(
+    (r: { title?: string; url?: string; content?: string }) => ({
+      title: r.title || "",
+      url: r.url || "",
+      snippet: r.content || "",
+    })
+  );
+}
+
+// --- Google Custom Search ---
+async function searchGoogleCSE(
+  query: string,
+  apiKey: string,
+  cxId: string,
+  maxResults: number
+) {
+  if (!apiKey || !cxId)
+    throw new Error("Google CSE requires API key and CX ID");
+
+  const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cxId}&q=${encodeURIComponent(query)}&num=${maxResults}`;
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) throw new Error(`Google CSE error: ${response.status}`);
+
+  const data = await response.json();
+  return (data.items || []).map(
+    (r: { title?: string; link?: string; snippet?: string }) => ({
+      title: r.title || "",
+      url: r.link || "",
+      snippet: r.snippet || "",
+    })
+  );
+}
+
+// --- Page Reading (Crawl4AI / Jina Reader) ---
+async function readPage(
+  targetUrl: string,
+  pageReaderUrl: string
+): Promise<string | null> {
+  try {
+    const crawlUrl = `${pageReaderUrl.replace(/\/+$/, "")}/crawl`;
+    const response = await fetch(crawlUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: targetUrl }),
+      signal: AbortSignal.timeout(20000),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    // Extract markdown content from Crawl4AI or Jina Reader response
+    if (data.content?.markdown) {
+      return data.content.markdown.slice(0, 5000);
+    }
+    if (data.success && data.content) {
+      return typeof data.content === "string"
+        ? data.content.slice(0, 5000)
+        : JSON.stringify(data.content).slice(0, 5000);
+    }
+    return null;
+  } catch {
+    return null;
   }
 }

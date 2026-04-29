@@ -8,41 +8,49 @@ import { ChatView } from "@/components/chat/ChatView";
 import { ResearchView } from "@/components/research/ResearchView";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 
-export default function NebChatApp() {
-  const { activeView, initialize, sidebarOpen, setSidebarOpen } = useAppStore();
+export default function Page() {
+  const initialize = useAppStore((s) => s.initialize);
+  const activeView = useAppStore((s) => s.activeView);
+  const sidebarOpen = useAppStore((s) => s.sidebarOpen);
+  const settingsOpen = useAppStore((s) => s.settingsOpen);
 
   useEffect(() => {
     initialize();
   }, [initialize]);
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-background">
-      {/* Mobile sidebar backdrop */}
+    <div className="flex h-dvh w-full overflow-hidden bg-background">
+      {/* Sidebar */}
+      <AppSidebar />
+
+      {/* Mobile backdrop */}
       {sidebarOpen && (
-        <div className="fixed inset-0 bg-black/40 z-10 md:hidden" onClick={() => setSidebarOpen(false)} />
+        <div
+          className="fixed inset-0 z-30 bg-black/50 md:hidden"
+          onClick={() => useAppStore.getState().setSidebarOpen(false)}
+        />
       )}
 
-      {/* Sidebar */}
-      <div className={`z-20 md:z-0 ${sidebarOpen ? "fixed md:relative" : ""}`}>
-        <AppSidebar />
-      </div>
+      {/* Main content */}
+      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        {/* Sidebar toggle (shown when sidebar is closed) */}
+        {!sidebarOpen && <SidebarToggle />}
 
-      {/* Main Content - all views stay mounted so streams don't die */}
-      <div className="flex-1 flex flex-col min-w-0 min-h-0 relative">
-        <SidebarToggle />
-        <div className={activeView === "home" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
-          <HomeView />
+        <div className="flex-1 overflow-hidden">
+          <div className={activeView === "home" ? "" : "hidden h-full"}>
+            <HomeView />
+          </div>
+          <div className={activeView === "chat" ? "" : "hidden h-full"}>
+            <ChatView />
+          </div>
+          <div className={activeView === "research" ? "" : "hidden h-full"}>
+            <ResearchView />
+          </div>
         </div>
-        <div className={activeView === "chat" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
-          <ChatView />
-        </div>
-        <div className={activeView === "research" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
-          <ResearchView />
-        </div>
-      </div>
+      </main>
 
-      {/* Settings Dialog */}
-      <SettingsDialog />
+      {/* Settings dialog */}
+      <SettingsDialog open={settingsOpen} onOpenChange={(open) => useAppStore.getState().setSettingsOpen(open)} />
     </div>
   );
 }

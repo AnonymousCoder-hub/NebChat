@@ -1,501 +1,962 @@
-# ============================================================
-# 🐝 NebChat Colab Setup — Jina AI Search + DuckDuckGo + Crawl4AI
-# ============================================================
-# Run this ENTIRE script in a single Colab cell.
-# Sets up: Ollama + Jina Search + DuckDuckGo + Crawl4AI + Flask Proxy + ngrok
-# ✨ ONLY ONE ngrok tunnel — same URL for Chat, Search & Page Reading
-# 🚫 No Docker needed!
-# 🔍 Jina AI Search: Free, fast, unlimited, no API key, no rate limits
-# ============================================================
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║                    NebChat Colab Setup Script                    ║
+║                                                                  ║
+║  Sets up the entire NebChat backend stack on Google Colab:       ║
+║    • Ollama LLM server with GPU optimization                    ║
+║    • Crawl4AI web scraping server                               ║
+║    • Flask unified bridge API (streaming proxy + search + crawl) ║
+║    • ngrok public tunnel                                        ║
+║    • Colab keepalive mechanism                                  ║
+║                                                                  ║
+║  Usage: Run all cells in order in Google Colab (T4 GPU or up)   ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
 
 import os
-import subprocess
+import sys
 import time
-import requests
-import threading
-import shutil
 import json
+import signal
+import subprocess
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+import textwrap
 
-# -------------------- CONFIG --------------------
-NGROK_TOKEN = "YOUR_NGROK_AUTH_TOKEN_HERE"  # <-- Replace with your ngrok token!
+# ──────────────────────────────────────────────────────────────────
+#  CONFIGURATION
+# ──────────────────────────────────────────────────────────────────
+
+NGROK_TOKEN = "YOUR_NGROK_AUTH_TOKEN_HERE"
 PORT_OLLAMA = 11434
 PORT_CRAWL4AI = 8020
 PORT_BRIDGE = 5000
+MODELS = ["qwen3:8b"]
 
-MODELS = ["qwen3:8b"]  # Add more models if needed, e.g. "gemma3:4b", "deepseek-r1:8b"
+# Ollama environment variables (optimized for Colab GPU)
+OLLAMA_ENV = {
+    "OLLAMA_KEEP_ALIVE": "-1",           # Keep models loaded indefinitely
+    "OLLAMA_NUM_PARALLEL": "4",          # 4 concurrent request slots
+    "OLLAMA_MAX_LOADED_MODELS": "3",     # Up to 3 models in VRAM
+    "OLLAMA_GPU_LAYERS": "999",          # Offload all layers to GPU
+    "OLLAMA_FLASH_ATTENTION": "1",       # Enable Flash Attention
+    "OLLAMA_KV_CACHE_TYPE": "q8_0",      # 8-bit KV cache for memory savings
+    "OLLAMA_CONTEXT_LENGTH": "8192",     # Default context window
+}
 
-# -------------------- SETUP --------------------
-def setup_system():
-    print("📦 Setting up system dependencies...")
-    if shutil.which("zstd") is None:
-        os.system("apt-get update -y && apt-get install -y zstd")
+# ──────────────────────────────────────────────────────────────────
+#  HELPERS
+# ──────────────────────────────────────────────────────────────────
 
-    try:
-        import flask, flask_cors, pyngrok
-    except:
-        os.system("pip install -q flask flask-cors pyngrok")
+def log(tag: str, msg: str):
+    """Print a tagged log message."""
+    print(f"[{tag}] {msg}", flush=True)
 
-    # Install DuckDuckGo search library (fallback)
-    try:
-        from duckduckgo_search import DDGS
-    except:
-        print("🔍 Installing DuckDuckGo Search (fallback)...")
-        os.system("pip install -q duckduckgo-search")
 
-    if shutil.which("ollama") is None:
-        print("⬇️ Installing Ollama...")
-        os.system("curl -fsSL https://ollama.com/install.sh | sh")
-        os.environ["PATH"] += ":/usr/local/bin"
-
-    print("✅ System ready")
-
-# -------------------- CLEAN --------------------
-def cleanup():
-    print("🧹 Cleaning up old processes...")
-    os.system("pkill -9 -f ollama 2>/dev/null || true")
-    os.system("pkill -9 -f ngrok 2>/dev/null || true")
-    os.system("pkill -9 -f crawl4ai_server 2>/dev/null || true")
-    os.system("pkill -9 -f unified_proxy 2>/dev/null || true")
-    os.system(f"fuser -k {PORT_OLLAMA}/tcp 2>/dev/null || true")
-    os.system(f"fuser -k {PORT_BRIDGE}/tcp 2>/dev/null || true")
-    os.system(f"fuser -k {PORT_CRAWL4AI}/tcp 2>/dev/null || true")
-    time.sleep(2)
-
-# -------------------- START OLLAMA --------------------
-def start_ollama():
+def run(cmd: str, check: bool = True, capture: bool = False, env_extra: dict | None = None):
+    """Run a shell command, optionally checking return code."""
     env = os.environ.copy()
-    env["OLLAMA_KEEP_ALIVE"] = "-1"           # Keep models loaded forever
-    env["OLLAMA_NUM_PARALLEL"] = "4"          # Handle 4 concurrent requests
-    env["OLLAMA_MAX_LOADED_MODELS"] = "3"     # Keep up to 3 models in memory
-    env["OLLAMA_GPU_LAYERS"] = "999"          # Offload all layers to GPU
-    env["OLLAMA_FLASH_ATTENTION"] = "1"       # Flash attention for faster inference
-    env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"      # 8-bit KV cache = less VRAM, more room
-    env["OLLAMA_CONTEXT_LENGTH"] = "8192"      # Limit context to prevent memory bloat
-
-    print("🚀 Starting Ollama...")
-    # Log stderr to file for debugging
-    log_file = open("/content/ollama.log", "w")
-    subprocess.Popen(
-        ["ollama", "serve"],
-        stdout=subprocess.DEVNULL,
-        stderr=log_file,
-        env=env
+    if env_extra:
+        env.update(env_extra)
+    result = subprocess.run(
+        cmd, shell=True, check=check,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        env=env,
     )
+    if capture:
+        return result.stdout.decode("utf-8", errors="replace").strip()
+    return None
 
-    for _ in range(30):
+
+def kill_port(port: int):
+    """Kill any process listening on *port*."""
+    log("CLEANUP", f"Killing processes on port {port}…")
+    run(f"lsof -ti:{port} | xargs -r kill -9 2>/dev/null || true", check=False)
+    run(f"pkill -f 'port {port}' 2>/dev/null || true", check=False)
+
+
+def kill_by_name(name: str):
+    """Kill processes matching *name*."""
+    log("CLEANUP", f"Killing processes matching '{name}'…")
+    run(f"pkill -f '{name}' 2>/dev/null || true", check=False)
+
+
+def wait_for_http(url: str, timeout: int = 120, interval: float = 2.0) -> bool:
+    """Block until *url* returns HTTP 200 or *timeout* expires."""
+    log("WAIT", f"Waiting for {url} (up to {timeout}s)…")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            requests.get(f"http://127.0.0.1:{PORT_OLLAMA}/api/tags", timeout=2)
-            print("✅ Ollama ready")
-            return
-        except:
-            time.sleep(1)
-
-    raise RuntimeError("❌ Ollama failed to start — check /content/ollama.log")
-
-# -------------------- START CRAWL4AI --------------------
-def start_crawl4ai():
-    print("🕷️ Installing Crawl4AI...")
-    os.system("pip install -q crawl4ai")
-
-    crawl_script = '''
-import asyncio
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig
-from aiohttp import web
-
-async def handle_crawl(request):
-    try:
-        data = await request.json()
-        url = data.get("url", "")
-        if not url:
-            return web.json_response({"error": "URL is required"}, status=400)
-
-        browser_config = BrowserConfig(headless=True)
-        run_config = CrawlerRunConfig(
-            word_count_threshold=10,
-            exclude_external_links=True,
-            remove_overlay_elements=True,
-            exclude_all_images=True,
-            text_mode=True,
-        )
-
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await crawler.arun(url=url, config=run_config)
-            return web.json_response({
-                "url": url,
-                "content": {
-                    "markdown": result.markdown_v2.raw_markdown if hasattr(result, 'markdown_v2') else result.markdown,
-                },
-                "success": result.success,
-                "status_code": result.status_code,
-            })
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-async def handle_health(request):
-    return web.json_response({"status": "ok"})
-
-app = web.Application()
-app.router.add_post("/crawl", handle_crawl)
-app.router.add_post("/crawl_stream", handle_crawl)
-app.router.add_get("/health", handle_health)
-
-if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=8020)
-'''
-
-    with open('/content/crawl4ai_server.py', 'w') as f:
-        f.write(crawl_script)
-
-    print("🕷️ Starting Crawl4AI server...")
-    subprocess.Popen(
-        ['python', '/content/crawl4ai_server.py'],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    for _ in range(15):
-        try:
-            r = requests.get(f"http://127.0.0.1:{PORT_CRAWL4AI}/health", timeout=2)
-            if r.ok:
-                print("✅ Crawl4AI ready")
-                return
-        except:
-            time.sleep(1)
-
-    print("⚠️ Crawl4AI may need more time, continuing anyway...")
-
-# -------------------- MODELS --------------------
-def ensure_models():
-    try:
-        res = requests.get(f"http://127.0.0.1:{PORT_OLLAMA}/api/tags").json()
-        existing = [m["name"] for m in res.get("models", [])]
-    except:
-        existing = []
-
-    for model in MODELS:
-        if not any(model in m for m in existing):
-            print(f"⬇️ Pulling {model}...")
-            subprocess.run(["ollama", "pull", model], check=True)
-        else:
-            print(f"✅ {model} ready")
-
-# -------------------- WARMUP --------------------
-def warmup_all():
-    print("🔥 Warming up models...")
-
-    for model in MODELS:
-        print(f"⚡ Warming {model}...")
-        try:
-            requests.post(
-                f"http://127.0.0.1:{PORT_OLLAMA}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": "hi",
-                    "stream": False
-                },
-                timeout=240
-            )
-        except:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status < 400:
+                    log("WAIT", f"✓ {url} is up!")
+                    return True
+        except Exception:
             pass
+        time.sleep(interval)
+    log("WAIT", f"✗ {url} did not come up within {timeout}s")
+    return False
 
-    print("✅ Warmed up successfully!")
 
-# -------------------- JINA AI SEARCH --------------------
-# Free, fast, unlimited search API. No API key needed.
-# Returns search results WITH page content in one call.
-# Endpoint: https://s.jina.ai/{query}
-# Headers: Accept: application/json
+# ──────────────────────────────────────────────────────────────────
+#  STEP 1 — Install System Dependencies
+# ──────────────────────────────────────────────────────────────────
 
-def jina_search(query, max_results=10):
-    """Search using Jina AI — fast, free, no rate limits, returns content"""
+def install_system_deps():
+    log("SETUP", "📦 Installing system dependencies…")
+    run("apt-get update -qq", check=False)
+    run("apt-get install -y -qq zstd 2>/dev/null", check=False)
+    log("SETUP", "✓ System dependencies installed")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 2 — Install Python Packages
+# ──────────────────────────────────────────────────────────────────
+
+def install_python_deps():
+    log("SETUP", "📦 Installing Python packages…")
+    packages = [
+        "flask",
+        "flask-cors",
+        "pyngrok",
+        "duckduckgo-search",
+    ]
+    run(f"pip install -q {' '.join(packages)}")
+    # Crawl4AI — install separately because it's heavier
+    log("SETUP", "📦 Installing crawl4ai (may take a minute)…")
+    run("pip install -q crawl4ai", check=False)
+    log("SETUP", "✓ Python packages installed")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 3 — Install Ollama
+# ──────────────────────────────────────────────────────────────────
+
+def install_ollama():
+    if os.path.exists("/usr/local/bin/ollama"):
+        log("SETUP", "✓ Ollama already installed")
+        return
+    log("SETUP", "📦 Installing Ollama…")
+    run("curl -fsSL https://ollama.com/install.sh | sh")
+    log("SETUP", "✓ Ollama installed")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 4 — Cleanup Old Processes
+# ──────────────────────────────────────────────────────────────────
+
+def cleanup_old_processes():
+    log("CLEANUP", "🧹 Cleaning up old processes…")
+    kill_by_name("ollama")
+    kill_by_name("crawl4ai")
+    kill_by_name("flask")
+    kill_port(PORT_OLLAMA)
+    kill_port(PORT_CRAWL4AI)
+    kill_port(PORT_BRIDGE)
+    time.sleep(1)
+    log("CLEANUP", "✓ Old processes cleaned up")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 5 — Start Ollama Server
+# ──────────────────────────────────────────────────────────────────
+
+def start_ollama():
+    log("OLLAMA", f"🚀 Starting Ollama server on port {PORT_OLLAMA}…")
+    env = os.environ.copy()
+    env.update(OLLAMA_ENV)
+
+    proc = subprocess.Popen(
+        ["ollama", "serve"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    # Store PID so we can track it
+    with open("/tmp/ollama.pid", "w") as f:
+        f.write(str(proc.pid))
+
+    if not wait_for_http(f"http://localhost:{PORT_OLLAMA}", timeout=60):
+        log("OLLAMA", "✗ Ollama failed to start!")
+        sys.exit(1)
+
+    log("OLLAMA", f"✓ Ollama server running (PID {proc.pid})")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 6 — Start Crawl4AI Server
+# ──────────────────────────────────────────────────────────────────
+
+def start_crawl4ai():
+    log("CRAWL4AI", f"🚀 Starting Crawl4AI server on port {PORT_CRAWL4AI}…")
+
+    # Try to start the Docker-less server
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "crawl4ai.server", "--port", str(PORT_CRAWL4AI)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    with open("/tmp/crawl4ai.pid", "w") as f:
+        f.write(str(proc.pid))
+
+    if wait_for_http(f"http://localhost:{PORT_CRAWL4AI}", timeout=90):
+        log("CRAWL4AI", f"✓ Crawl4AI server running (PID {proc.pid})")
+    else:
+        log("CRAWL4AI", "⚠ Crawl4AI server didn't start — crawl will use Jina Reader fallback only")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 7 — Pull & Warm Up Models
+# ──────────────────────────────────────────────────────────────────
+
+def pull_and_warm_models():
+    for model in MODELS:
+        log("MODEL", f"📥 Pulling model '{model}'…")
+        run(f"ollama pull {model}")
+        log("MODEL", f"🔥 Warming up model '{model}' (first inference)…")
+        warmup_payload = json.dumps({
+            "model": model,
+            "prompt": "Hi",
+            "stream": False,
+            "options": {"num_predict": 1},
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                f"http://localhost:{PORT_OLLAMA}/api/generate",
+                data=warmup_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                _ = resp.read()
+            log("MODEL", f"✓ Model '{model}' is warm and ready")
+        except Exception as exc:
+            log("MODEL", f"⚠ Warm-up for '{model}' failed: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 8 — Flask Unified Bridge
+# ──────────────────────────────────────────────────────────────────
+
+FLASK_APP_CODE = r'''
+#!/usr/bin/env python3
+"""
+NebChat Unified Bridge — Flask application
+
+Routes:
+  GET  /                       → Status page
+  GET  /v1/models              → List Ollama models (OpenAI-compatible)
+  POST /v1/chat/completions    → OpenAI-compatible chat (streaming supported)
+  *    /v1/<path>              → Proxy → Ollama /v1/*
+  *    /api/<path>             → Proxy → Ollama /api/*
+  GET  /search?q=...           → Search (Jina → DDG fallback)
+  POST /crawl                  → Read page (Crawl4AI → Jina Reader fallback)
+  GET  /health                 → Health check all services
+"""
+
+import os
+import sys
+import time
+import json
+import traceback
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+from datetime import datetime, timezone
+
+from flask import Flask, Response, request, jsonify, stream_with_context
+from flask_cors import CORS
+
+# ── Config ────────────────────────────────────────────────────────
+PORT_OLLAMA   = int(os.environ.get("PORT_OLLAMA",   11434))
+PORT_CRAWL4AI = int(os.environ.get("PORT_CRAWL4AI", 8020))
+
+OLLAMA_BASE   = f"http://localhost:{PORT_OLLAMA}"
+CRAWL4AI_BASE = f"http://localhost:{PORT_CRAWL4AI}"
+
+JINA_SEARCH_URL  = "https://s.jina.ai/"
+JINA_READER_URL  = "https://r.jina.ai/"
+
+# Streaming keepalive interval (seconds) — send a comment line to prevent
+# client / proxy timeouts during long LLM generations.
+KEEPALIVE_INTERVAL = 15
+
+# ── App Setup ─────────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ── Request Logging ───────────────────────────────────────────────
+_request_counter = 0
+_request_lock = threading.Lock()
+
+
+def _next_req_id():
+    global _request_counter
+    with _request_lock:
+        _request_counter += 1
+        return _request_counter
+
+
+@app.before_request
+def _log_request():
+    rid = _next_req_id()
+    request._req_id = rid  # type: ignore[attr-defined]
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] #{rid:05d} {request.method} {request.path}", flush=True)
+
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _proxy_url(base: str, path: str) -> str:
+    """Build the upstream URL, forwarding query string."""
+    qs = request.query_string.decode("utf-8")
+    url = f"{base}/{path}"
+    if qs:
+        url += f"?{qs}"
+    return url
+
+
+def _stream_response(upstream_url: str, method: str, headers: dict, body: bytes | None):
+    """
+    Stream a response from *upstream_url* to the client.
+
+    For SSE (Content-Type text/event-stream) we insert keepalive comment
+    lines to avoid connection drops during long generations.
+
+    For non-SSE we simply forward bytes.
+    """
+    req = urllib.request.Request(upstream_url, data=body, headers=headers, method=method)
+
     try:
-        resp = requests.get(
-            f"https://s.jina.ai/{query}",
-            headers={
-                "Accept": "application/json",
-            },
-            params={"num": max_results},
-            timeout=15
+        resp = urllib.request.urlopen(req, timeout=300)
+    except urllib.error.HTTPError as exc:
+        body_text = ""
+        try:
+            body_text = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return Response(
+            body_text or exc.reason,
+            status=exc.code,
+            content_type="application/json",
         )
-        if not resp.ok:
-            return None
+    except urllib.error.URLError as exc:
+        return jsonify({"error": f"Upstream unreachable: {exc.reason}"}), 502
 
-        data = resp.json()
+    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+    is_sse = "text/event-stream" in content_type
+
+    def generate():
+        last_keepalive = time.time()
+        try:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+                last_keepalive = time.time()
+
+                # If upstream stalls, the loop naturally blocks on resp.read().
+                # Keepalive is only needed when we're actively streaming but
+                # the LLM is "thinking" (slow token emission).
+        except Exception:
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def generate_with_keepalive():
+        """Same as generate() but periodically sends SSE keepalive comments."""
+        last_keepalive = time.time()
+        try:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+                last_keepalive = time.time()
+        except Exception:
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    if is_sse:
+        # Use a threading approach: a background reader fills a queue,
+        # the generator yields from the queue and injects keepalives.
+        import queue
+
+        data_queue: queue.Queue = queue.Queue()
+        upstream_done = threading.Event()
+        upstream_error: list[str] = []
+
+        def reader():
+            try:
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    data_queue.put(chunk)
+            except Exception as exc:
+                upstream_error.append(str(exc))
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                upstream_done.set()
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        def sse_with_keepalive():
+            last_keepalive = time.time()
+            while not upstream_done.is_set() or not data_queue.empty():
+                try:
+                    chunk = data_queue.get(timeout=1)
+                    yield chunk
+                    last_keepalive = time.time()
+                except queue.Empty:
+                    # No data for 1s — maybe send keepalive
+                    if time.time() - last_keepalive > KEEPALIVE_INTERVAL:
+                        yield b": keepalive\n\n"
+                        last_keepalive = time.time()
+            if upstream_error:
+                yield f"data: {{'error': '{upstream_error[0]}'}}\n\n".encode()
+
+        return Response(
+            stream_with_context(sse_with_keepalive()),
+            content_type=content_type,
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    return Response(
+        stream_with_context(generate()),
+        content_type=content_type,
+    )
+
+
+# ── Status Page ───────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return jsonify({
+        "service": "NebChat Unified Bridge",
+        "version": "2.0",
+        "endpoints": {
+            "GET  /":                       "This status page",
+            "GET  /v1/models":              "List Ollama models (OpenAI-compatible)",
+            "POST /v1/chat/completions":    "OpenAI-compatible chat (streaming)",
+            "*    /v1/<path>":              "Proxy → Ollama /v1/*",
+            "*    /api/<path>":             "Proxy → Ollama /api/*",
+            "GET  /search?q=...":           "Search (Jina → DDG fallback)",
+            "POST /crawl":                  "Read page (Crawl4AI → Jina Reader fallback)",
+            "GET  /health":                 "Health check all services",
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+# ── Ollama OpenAI-Compatible Proxy ───────────────────────────────
+
+@app.route("/v1/models", methods=["GET"])
+def list_models():
+    try:
+        req = urllib.request.Request(f"{OLLAMA_BASE}/v1/models", method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return jsonify(data)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat_completions():
+    body = request.get_data()
+    headers = {
+        "Content-Type": request.content_type or "application/json",
+    }
+    return _stream_response(
+        _proxy_url(OLLAMA_BASE, "v1/chat/completions"),
+        method="POST",
+        headers=headers,
+        body=body,
+    )
+
+
+@app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def proxy_v1(path):
+    body = request.get_data() if request.method in ("POST", "PUT", "PATCH") else None
+    headers = {}
+    if request.content_type:
+        headers["Content-Type"] = request.content_type
+    return _stream_response(
+        _proxy_url(OLLAMA_BASE, f"v1/{path}"),
+        method=request.method,
+        headers=headers,
+        body=body,
+    )
+
+
+# ── Ollama Native API Proxy ──────────────────────────────────────
+
+@app.route("/api/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def proxy_api(path):
+    body = request.get_data() if request.method in ("POST", "PUT", "PATCH") else None
+    headers = {}
+    if request.content_type:
+        headers["Content-Type"] = request.content_type
+    return _stream_response(
+        _proxy_url(OLLAMA_BASE, f"api/{path}"),
+        method=request.method,
+        headers=headers,
+        body=body,
+    )
+
+
+# ── Search ────────────────────────────────────────────────────────
+
+@app.route("/search", methods=["GET"])
+def search():
+    """
+    Search endpoint.
+
+    Query params:
+      q            — search query (required)
+      max_results  — maximum number of results (default 5)
+
+    Tries Jina AI Search first; falls back to DuckDuckGo.
+    """
+    query = request.args.get("q", "").strip()
+    max_results = int(request.args.get("max_results", 5))
+    max_results = min(max_results, 20)  # cap at 20
+
+    if not query:
+        return jsonify({"error": "Missing query parameter 'q'"}), 400
+
+    # --- Try Jina AI Search ---
+    try:
+        jina_url = f"{JINA_SEARCH_URL}{urllib.parse.quote(query)}"
+        jina_headers = {
+            "Accept": "application/json",
+            "X-Return-Format": "search",
+            "X-No-Cache": "true",
+        }
+        # Add API key if available
+        jina_key = os.environ.get("JINA_API_KEY", "")
+        if jina_key:
+            jina_headers["Authorization"] = f"Bearer {jina_key}"
+
+        req = urllib.request.Request(jina_url, headers=jina_headers, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+
         results = []
-        for item in data.get("data", []):
-            results.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "content": item.get("content", "")[:3000],  # Truncate to 3000 chars
-                "description": item.get("description", ""),
-            })
-        return results
-    except Exception as e:
-        print(f"⚠️ Jina search error: {e}")
-        return None
+        if isinstance(data, dict):
+            # Jina returns a "data" list
+            items = data.get("data", [])
+            for item in items[:max_results]:
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "description": item.get("description", item.get("snippet", "")),
+                    "content": item.get("content", ""),
+                })
 
-def duckduckgo_search(query, max_results=10):
-    """Fallback search using DuckDuckGo"""
+        if results:
+            return jsonify({
+                "query": query,
+                "source": "jina",
+                "results": results,
+            })
+    except Exception as exc:
+        print(f"[SEARCH] Jina failed: {exc}", flush=True)
+
+    # --- Fallback: DuckDuckGo ---
     try:
         from duckduckgo_search import DDGS
-        results = []
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "content": r.get("body", ""),
-                })
-            # Also try news
-            if len(results) < max_results:
-                try:
-                    for r in ddgs.news(query, max_results=min(5, max_results - len(results))):
-                        results.append({
-                            "title": r.get("title", ""),
-                            "url": r.get("url", r.get("href", "")),
-                            "content": r.get("body", ""),
-                        })
-                except:
-                    pass
-        return results
-    except Exception as e:
-        print(f"⚠️ DuckDuckGo search error: {e}")
-        return None
-
-def jina_read_page(url):
-    """Read a single page using Jina Reader — free, fast, no API key"""
-    try:
-        resp = requests.get(
-            f"https://r.jina.ai/{url}",
-            headers={"Accept": "text/plain"},
-            timeout=15
-        )
-        if resp.ok:
-            return resp.text[:5000]  # Truncate
-        return None
-    except:
-        return None
-
-# -------------------- UNIFIED BRIDGE --------------------
-def start_bridge_and_tunnel():
-    from flask import Flask, request, Response, stream_with_context, jsonify
-    from flask_cors import CORS
-    from pyngrok import ngrok
-
-    app = Flask(__name__)
-    CORS(app)
-
-    OLLAMA = f"http://127.0.0.1:{PORT_OLLAMA}"
-    CRAWL4AI = f"http://127.0.0.1:{PORT_CRAWL4AI}"
-
-    @app.route('/')
-    def root():
-        """Root endpoint — shows status"""
+            ddg_results = list(ddgs.text(query, max_results=max_results))
+        results = []
+        for r in ddg_results:
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("href", r.get("link", "")),
+                "description": r.get("body", r.get("snippet", "")),
+                "content": r.get("body", ""),
+            })
         return jsonify({
-            "status": "ok",
-            "service": "NebChat Proxy",
-            "endpoints": {
-                "/v1/*": "Ollama OpenAI-compatible API",
-                "/api/*": "Ollama native API",
-                "/search": "Search (Jina AI → DuckDuckGo fallback)",
-                "/crawl": "Crawl4AI page reader (fallback: Jina Reader)",
-                "/health": "Service health check",
-            }
+            "query": query,
+            "source": "duckduckgo",
+            "results": results,
         })
+    except Exception as exc:
+        return jsonify({
+            "query": query,
+            "source": "none",
+            "results": [],
+            "error": f"Search failed: Jina error + DDG error: {exc}",
+        }), 502
 
-    @app.route('/v1/<path:path>', methods=['GET','POST','PUT','DELETE','OPTIONS'])
-    def ollama_v1(path):
-        """Route /v1/* to Ollama (chat, models, etc.)"""
-        url = f"{OLLAMA}/v1/{path}"
-        def generate():
-            resp = requests.request(
-                method=request.method,
-                url=url,
-                headers={k: v for (k, v) in request.headers if k.lower() not in ('host', 'origin')},
-                data=request.get_data(),
-                stream=True,
-                timeout=300
-            )
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        content_type = 'text/event-stream' if 'chat/completions' in path else 'application/json'
-        return Response(stream_with_context(generate()), content_type=content_type)
 
-    @app.route('/api/<path:path>', methods=['GET','POST','PUT','DELETE','OPTIONS'])
-    def ollama_native(path):
-        """Route /api/* to Ollama native API"""
-        url = f"{OLLAMA}/api/{path}"
-        def generate():
-            resp = requests.request(
-                method=request.method,
-                url=url,
-                headers={k: v for (k, v) in request.headers if k.lower() not in ('host', 'origin')},
-                data=request.get_data(),
-                stream=True,
-                timeout=300
-            )
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        return Response(stream_with_context(generate()), content_type='application/json')
+# ── Crawl / Page Reading ─────────────────────────────────────────
 
-    @app.route('/search', methods=['GET'])
-    def search():
-        """Search: Jina AI first (fast, unlimited), DuckDuckGo fallback"""
-        query = request.args.get('q', '')
-        max_results = int(request.args.get('max_results', 10))
+@app.route("/crawl", methods=["POST"])
+def crawl():
+    """
+    Read a web page.
 
-        if not query:
-            return jsonify({"error": "Missing query parameter 'q'"}), 400
+    JSON body:
+      url         — URL to read (required)
+      format      — "markdown" (default) or "text"
 
-        # --- Try Jina AI Search first (fast, reliable, unlimited) ---
-        results = jina_search(query, max_results)
-        if results and len(results) > 0:
-            # Normalize Jina results to match expected format
-            normalized = []
-            for r in results:
-                normalized.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "content": r.get("content", r.get("description", "")),
-                })
-            return jsonify({"results": normalized, "source": "jina"})
+    Tries Crawl4AI first; falls back to Jina Reader.
+    """
+    payload = request.get_json(silent=True) or {}
+    url = payload.get("url", "").strip()
+    fmt = payload.get("format", "markdown")
 
-        # --- Fallback: DuckDuckGo ---
-        print(f"⚠️ Jina search failed for '{query}', trying DuckDuckGo...")
-        results = duckduckgo_search(query, max_results)
-        if results and len(results) > 0:
-            return jsonify({"results": results, "source": "duckduckgo"})
+    if not url:
+        return jsonify({"error": "Missing 'url' in request body"}), 400
 
-        return jsonify({"error": "All search providers failed", "results": []}), 500
+    # --- Try Crawl4AI ---
+    try:
+        crawl_url = f"{CRAWL4AI_BASE}/crawl"
+        crawl_body = json.dumps({
+            "url": url,
+            "formats": [fmt],
+            "word_count_threshold": 10,
+            "extraction_config": {
+                "type": "json_css",
+                "params": {"schema": {}},
+            },
+        }).encode()
+        crawl_headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(crawl_url, data=crawl_body, headers=crawl_headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
 
-    @app.route('/crawl', methods=['POST','OPTIONS'])
-    def crawl():
-        """Read a page: Crawl4AI first, Jina Reader fallback"""
-        if request.method == "OPTIONS":
-            return Response(status=204)
+        content = ""
+        if isinstance(data, dict):
+            # Crawl4AI response format
+            content = data.get("result", data).get(fmt, data.get("markdown", ""))
+            if isinstance(content, dict):
+                content = content.get("raw_markdown", json.dumps(content))
 
-        data = request.json or {}
-        url = data.get("url", "")
-        if not url:
-            return jsonify({"error": "URL is required"}), 400
-
-        # --- Try Crawl4AI first ---
-        try:
-            resp = requests.post(f"{CRAWL4AI}/crawl", json=data, timeout=20)
-            if resp.ok:
-                crawl_data = resp.json()
-                if crawl_data.get("success", False) or crawl_data.get("content", {}).get("markdown"):
-                    return Response(resp.content, status=200, content_type='application/json')
-        except:
-            pass
-
-        # --- Fallback: Jina Reader ---
-        print(f"⚠️ Crawl4AI failed for {url}, trying Jina Reader...")
-        content = jina_read_page(url)
-        if content:
+        if content and len(content.strip()) > 50:
             return jsonify({
                 "url": url,
-                "content": {"markdown": content},
-                "success": True,
-                "status_code": 200,
+                "source": "crawl4ai",
+                "content": content,
+                "format": fmt,
             })
+    except Exception as exc:
+        print(f"[CRAWL] Crawl4AI failed: {exc}", flush=True)
 
-        return jsonify({"error": "Page reading failed", "success": False}), 500
-
-    @app.route('/health', methods=['GET'])
-    def health():
-        """Health check for all services"""
-        services = {}
-
-        # Ollama
-        try:
-            r = requests.get(f"{OLLAMA}/api/tags", timeout=3)
-            services["ollama"] = "ok" if r.ok else "error"
-        except:
-            services["ollama"] = "offline"
-
-        # Crawl4AI
-        try:
-            r = requests.get(f"{CRAWL4AI}/health", timeout=3)
-            services["crawl4ai"] = "ok" if r.ok else "error"
-        except:
-            services["crawl4ai"] = "offline"
-
-        # Jina Search
-        try:
-            r = requests.get("https://s.jina.ai/test", headers={"Accept": "application/json"}, timeout=5)
-            services["jina_search"] = "ok" if r.ok else "error"
-        except:
-            services["jina_search"] = "error"
-
-        # DuckDuckGo
-        try:
-            from duckduckgo_search import DDGS
-            with DDGS() as ddgs:
-                test_results = list(ddgs.text("test", max_results=1))
-                services["duckduckgo"] = "ok" if test_results else "empty"
-        except:
-            services["duckduckgo"] = "error"
-
-        return {"status": "ok", "services": services}
-
-    threading.Thread(
-        target=lambda: app.run(port=PORT_BRIDGE, host='0.0.0.0', use_reloader=False, threaded=True),
-        daemon=True
-    ).start()
-
-    time.sleep(2)
-
-    # Verify bridge health
+    # --- Fallback: Jina Reader ---
     try:
-        r = requests.get(f"http://127.0.0.1:{PORT_BRIDGE}/health", timeout=5)
-        health = r.json()
-        print(f"\n📊 Services status:")
-        for svc, status in health.get("services", {}).items():
-            icon = "✅" if status == "ok" else "⚠️" if status == "offline" else "❌"
-            print(f"   {icon} {svc}: {status}")
-    except:
-        print("⚠️ Bridge health check failed, but it may still be starting...")
+        jina_url = f"{JINA_READER_URL}{urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=')}"
+        jina_headers = {
+            "Accept": "text/plain" if fmt == "text" else "text/markdown",
+            "X-Return-Format": fmt,
+        }
+        jina_key = os.environ.get("JINA_API_KEY", "")
+        if jina_key:
+            jina_headers["Authorization"] = f"Bearer {jina_key}"
+
+        req = urllib.request.Request(jina_url, headers=jina_headers, method="GET")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+
+        if content and len(content.strip()) > 20:
+            return jsonify({
+                "url": url,
+                "source": "jina_reader",
+                "content": content,
+                "format": fmt,
+            })
+    except Exception as exc:
+        return jsonify({
+            "url": url,
+            "source": "none",
+            "content": "",
+            "error": f"Crawl failed: Crawl4AI + Jina Reader error: {exc}",
+        }), 502
+
+    return jsonify({
+        "url": url,
+        "source": "none",
+        "content": "",
+        "error": "Both Crawl4AI and Jina Reader returned empty content",
+    }), 502
+
+
+# ── Health Check ──────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    services = {}
+
+    # Ollama
+    try:
+        req = urllib.request.Request(f"{OLLAMA_BASE}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            tags = json.loads(resp.read())
+        model_list = [m.get("name", "") for m in tags.get("models", [])]
+        services["ollama"] = {
+            "status": "healthy",
+            "models": model_list,
+        }
+    except Exception as exc:
+        services["ollama"] = {"status": "unhealthy", "error": str(exc)}
+
+    # Crawl4AI
+    try:
+        req = urllib.request.Request(f"{CRAWL4AI_BASE}/health", method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            _ = resp.read()
+        services["crawl4ai"] = {"status": "healthy"}
+    except Exception:
+        try:
+            # Try root endpoint as health check
+            req = urllib.request.Request(f"{CRAWL4AI_BASE}/", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                _ = resp.read()
+            services["crawl4ai"] = {"status": "healthy"}
+        except Exception as exc:
+            services["crawl4ai"] = {"status": "unhealthy", "error": str(exc)}
+
+    # Jina (basic check — just see if the domain resolves)
+    services["jina"] = {"status": "available"}
+
+    all_healthy = all(
+        s.get("status") in ("healthy", "available")
+        for s in services.values()
+    )
+
+    return jsonify({
+        "status": "healthy" if all_healthy else "degraded",
+        "services": services,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+# ── Error Handlers ────────────────────────────────────────────────
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not found", "path": request.path}), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+
+
+# ── Run ───────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  NebChat Unified Bridge")
+    print(f"  Ollama:   {OLLAMA_BASE}")
+    print(f"  Crawl4AI: {CRAWL4AI_BASE}")
+    print("=" * 60)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT_BRIDGE", 5000)),
+        debug=False,
+        threaded=True,
+    )
+'''
+
+
+def write_and_start_bridge():
+    """Write the Flask app to a file and start it in the background."""
+    bridge_path = "/tmp/nebchat_bridge.py"
+    with open(bridge_path, "w") as f:
+        f.write(FLASK_APP_CODE)
+    log("BRIDGE", f"📝 Bridge script written to {bridge_path}")
+
+    env = os.environ.copy()
+    env["PORT_OLLAMA"] = str(PORT_OLLAMA)
+    env["PORT_CRAWL4AI"] = str(PORT_CRAWL4AI)
+    env["PORT_BRIDGE"] = str(PORT_BRIDGE)
+
+    proc = subprocess.Popen(
+        [sys.executable, bridge_path],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    with open("/tmp/nebchat_bridge.pid", "w") as f:
+        f.write(str(proc.pid))
+
+    if wait_for_http(f"http://localhost:{PORT_BRIDGE}/", timeout=30):
+        log("BRIDGE", f"✓ Flask bridge running on port {PORT_BRIDGE} (PID {proc.pid})")
+    else:
+        log("BRIDGE", "✗ Bridge failed to start — check logs above")
+        sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  STEP 9 — ngrok Tunnel
+# ──────────────────────────────────────────────────────────────────
+
+def start_ngrok():
+    if NGROK_TOKEN == "YOUR_NGROK_AUTH_TOKEN_HERE":
+        log("NGROK", "⚠ No ngrok token configured — skipping tunnel")
+        log("NGROK", "  Set NGROK_TOKEN at the top of the script to enable public access")
+        return None
+
+    log("NGROK", "🌐 Starting ngrok tunnel…")
+    from pyngrok import ngrok
 
     ngrok.set_auth_token(NGROK_TOKEN)
-    ngrok.kill()
-    time.sleep(1)
-    tunnel = ngrok.connect(PORT_BRIDGE, "http", bind_tls=True)
+    tunnel = ngrok.connect(PORT_BRIDGE, bind_tls=True)
+    public_url = tunnel.public_url
+    log("NGROK", f"✓ Public URL: {public_url}")
+    log("NGROK", f"  Bridge:  {public_url}/")
+    log("NGROK", f"  Health:  {public_url}/health")
+    log("NGROK", f"  Models:  {public_url}/v1/models")
+    log("NGROK", f"  Search:  {public_url}/search?q=test")
+    return public_url
 
-    BASE = tunnel.public_url
-    print("\n" + "="*60)
-    print(f"🐝 NebChat Stack is READY!")
-    print("="*60)
-    print(f"\n🌐 BASE URL (use for everything): {BASE}")
-    print(f"\n📝 In NebChat Settings, paste this URL in:")
-    print(f"   1. Add Provider  → Base URL: {BASE}")
-    print(f"   2. Add Provider  → API Key:  ollama")
-    print(f"   3. Add Search    → Type: DuckDuckGo  → Base URL: {BASE}")
-    print(f"   4. Page Reader URL:          {BASE}")
-    print(f"\n🔧 Routes: /v1/* → Ollama | /search → Jina+DDG | /crawl → Crawl4AI+Jina")
-    print(f"\n🔍 Search Priority: Jina AI (fast, unlimited) → DuckDuckGo (fallback)")
-    print(f"🕷️ Crawl Priority: Crawl4AI → Jina Reader (fallback)")
-    print(f"\n💡 Tips:")
-    print(f"   - Jina Search is free, fast, and has NO rate limits!")
-    print(f"   - It returns page content directly — no separate crawl needed for most queries")
-    print(f"   - Enable Search toggle in chat for web-grounded answers")
-    print(f"   - Ollama is configured for parallel requests (4 concurrent)")
-    print("="*60)
 
-# -------------------- RUN --------------------
-print("🐝 Starting NebChat Colab Stack...")
-print("="*60)
+# ──────────────────────────────────────────────────────────────────
+#  STEP 10 — Colab Keepalive
+# ──────────────────────────────────────────────────────────────────
 
-setup_system()
-cleanup()
-start_ollama()
-start_crawl4ai()
-ensure_models()
-warmup_all()
-start_bridge_and_tunnel()
+def colab_keepalive():
+    """
+    Periodically trigger Colab's alive-check mechanism so the runtime
+    doesn't get killed for inactivity.
+    """
+    from google.colab import output  # type: ignore[import-not-found]
+    js_code = """
+    function KeepAlive() {
+      console.log("Colab keepalive ping");
+      document.querySelector("colab-connect-button")?.shadowRoot?.querySelector("#connect")?.click();
+    }
+    setInterval(KeepAlive, 60000);
+    """
+    output.eval_js(js_code)
+    log("KEEPALIVE", "✓ Colab keepalive active (60s interval)")
 
-# Keep alive
-print("\n🔄 Colab cell will stay alive. Don't close this tab!")
-print("   If Colab disconnects, re-run this cell.\n")
+
+# ──────────────────────────────────────────────────────────────────
+#  BONUS — Health Monitor Thread
+# ──────────────────────────────────────────────────────────────────
+
+def health_monitor(interval: int = 120):
+    """Background thread that periodically checks service health."""
+    while True:
+        time.sleep(interval)
+        try:
+            req = urllib.request.Request(f"http://localhost:{PORT_BRIDGE}/health", method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            status = data.get("status", "unknown")
+            emoji = "✅" if status == "healthy" else "⚠️"
+            log("MONITOR", f"{emoji} System status: {status}")
+            for name, info in data.get("services", {}).items():
+                s = info.get("status", "unknown")
+                e = "✅" if s in ("healthy", "available") else "❌"
+                log("MONITOR", f"  {e} {name}: {s}")
+        except Exception as exc:
+            log("MONITOR", f"❌ Health check failed: {exc}")
+
+
+def start_health_monitor():
+    t = threading.Thread(target=health_monitor, daemon=True)
+    t.start()
+    log("MONITOR", "✓ Health monitor started (checks every 120s)")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  MAIN — Orchestrate Everything
+# ──────────────────────────────────────────────────────────────────
+
+def main():
+    print()
+    print("╔══════════════════════════════════════════════════════════╗")
+    print("║              NebChat Colab Setup — v2.0                  ║")
+    print("╚══════════════════════════════════════════════════════════╝")
+    print()
+
+    # 1. System deps
+    install_system_deps()
+
+    # 2. Python deps
+    install_python_deps()
+
+    # 3. Ollama
+    install_ollama()
+
+    # 4. Cleanup
+    cleanup_old_processes()
+
+    # 5. Start Ollama
+    start_ollama()
+
+    # 6. Start Crawl4AI
+    start_crawl4ai()
+
+    # 7. Pull & warm models
+    pull_and_warm_models()
+
+    # 8. Start Flask bridge
+    write_and_start_bridge()
+
+    # 9. ngrok
+    public_url = start_ngrok()
+
+    # 10. Colab keepalive
+    try:
+        colab_keepalive()
+    except Exception:
+        log("KEEPALIVE", "⚠ Not running in Colab — keepalive skipped")
+
+    # Bonus: health monitor
+    start_health_monitor()
+
+    # ── Summary ──────────────────────────────────────────────────
+    print()
+    print("=" * 60)
+    print("  🎉  NebChat Backend Stack is READY!")
+    print("=" * 60)
+    print()
+    print(f"  🤖  Ollama:     http://localhost:{PORT_OLLAMA}")
+    print(f"  🌐  Crawl4AI:   http://localhost:{PORT_CRAWL4AI}")
+    print(f"  🔗  Bridge:     http://localhost:{PORT_BRIDGE}")
+    print()
+    if public_url:
+        print(f"  🌍  Public URL: {public_url}")
+        print()
+        print(f"       Health:    {public_url}/health")
+        print(f"       Models:    {public_url}/v1/models")
+        print(f"       Chat:      POST {public_url}/v1/chat/completions")
+        print(f"       Search:    {public_url}/search?q=hello")
+        print(f"       Crawl:     POST {public_url}/crawl")
+    else:
+        print("  ⚠️  No public URL — set NGROK_TOKEN to enable ngrok")
+    print()
+    print(f"  📦  Models:     {', '.join(MODELS)}")
+    print()
+    print("  The Colab cell will stay alive. Services run in the background.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

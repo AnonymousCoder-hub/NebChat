@@ -1,5 +1,15 @@
 import { create } from "zustand";
-import { APIProvider, Conversation, Message, AppView, ModelInfo, SearchProvider, TokenStats, SwarmStep } from "./types";
+import {
+  APIProvider,
+  Conversation,
+  Message,
+  AppView,
+  ModelInfo,
+  SearchProvider,
+  TokenStats,
+  SwarmStep,
+  SearchResult,
+} from "./types";
 import * as storage from "./storage";
 
 interface AppState {
@@ -7,7 +17,7 @@ interface AppState {
   providers: APIProvider[];
   conversations: Conversation[];
   searchProviders: SearchProvider[];
-  
+
   // UI State
   activeView: AppView;
   activeConversationId: string | null;
@@ -20,50 +30,72 @@ interface AppState {
   searchEnabled: boolean;
   activeSearchProviderId: string | null;
   pageReaderUrl: string | null;
-  
+
   // Actions
   initialize: () => void;
   setActiveView: (view: AppView) => void;
   setSidebarOpen: (open: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
-  
+
   // Provider actions
   addProvider: (provider: APIProvider) => void;
   updateProvider: (id: string, updates: Partial<APIProvider>) => void;
   removeProvider: (id: string) => void;
   setProviderModels: (providerId: string, models: ModelInfo[]) => void;
-  
+
   // Conversation actions
   setActiveConversationId: (id: string | null) => void;
   createConversation: (modelId: string, providerId: string) => string;
-  createSwarmConversation: (topic: string, agents: { name: string; role: string; modelId: string; providerId: string; thinkingEnabled?: boolean }[], maxSteps: number) => string;
+  createSwarmConversation: (
+    topic: string,
+    agents: {
+      name: string;
+      role: string;
+      modelId: string;
+      providerId: string;
+      thinkingEnabled?: boolean;
+    }[],
+    maxSteps: number
+  ) => string;
   deleteConversation: (id: string) => void;
   addMessage: (conversationId: string, message: Message) => void;
-  updateMessage: (conversationId: string, messageId: string, content: string, thinking?: string, tokenStats?: TokenStats) => void;
+  updateMessage: (
+    conversationId: string,
+    messageId: string,
+    content: string,
+    thinking?: string,
+    tokenStats?: TokenStats
+  ) => void;
+  updateMessageSearchResults: (
+    conversationId: string,
+    messageId: string,
+    searchResults: SearchResult[],
+    searchQueries: string[]
+  ) => void;
   updateSwarmOutput: (conversationId: string, output: string) => void;
   updateSwarmSteps: (conversationId: string, steps: SwarmStep[]) => void;
-  
+
   // Model selection
   setSelectedModel: (modelId: string, providerId: string) => void;
-  
+
   // Streaming
   setIsStreaming: (streaming: boolean) => void;
-  
+
   // Thinking toggle
   setThinkingEnabled: (enabled: boolean) => void;
-  
+
   // Search toggle
   setSearchEnabled: (enabled: boolean) => void;
   setActiveSearchProviderId: (id: string | null) => void;
-  
+
   // Page reader
   setPageReaderUrl: (url: string | null) => void;
-  
+
   // Search provider actions
   addSearchProvider: (provider: SearchProvider) => void;
   updateSearchProvider: (id: string, updates: Partial<SearchProvider>) => void;
   removeSearchProvider: (id: string) => void;
-  
+
   // Helpers
   getActiveConversation: () => Conversation | undefined;
   getSelectedProvider: () => APIProvider | undefined;
@@ -98,15 +130,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     const searchEnabled = storage.getSearchEnabled();
     const activeSearchProviderId = storage.getActiveSearchProviderId();
     const pageReaderUrl = storage.getPageReaderUrl();
-    
-    // Start with sidebar closed on mobile
-    const isMobile = typeof window !== "undefined" && window.innerWidth < 768;
-    
+
+    const isMobile =
+      typeof window !== "undefined" && window.innerWidth < 768;
+
     set({
       providers,
       conversations,
       searchProviders,
-      activeView: ["home", "chat", "settings", "research"].includes(activeView) ? activeView : "home",
+      activeView: ["home", "chat", "settings", "research"].includes(activeView)
+        ? activeView
+        : "home",
       activeConversationId,
       selectedModelId: selected?.modelId || null,
       selectedProviderId: selected?.providerId || null,
@@ -144,7 +178,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       providers,
       conversations,
-      selectedProviderId: selectedProviderId === id ? null : selectedProviderId,
+      selectedProviderId:
+        selectedProviderId === id ? null : selectedProviderId,
       selectedModelId: selectedProviderId === id ? null : selectedModelId,
     });
   },
@@ -158,15 +193,24 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveConversationId: (id) => {
     storage.setActiveConversationId(id);
     if (id) {
-      // Check if this is a swarm conversation
-      const conv = storage.getConversations().find((c) => c.id === id);
-      // Auto-close sidebar on mobile when selecting a conversation
-      const isMobile = typeof window !== "undefined" && window.innerWidth < 768;
+      const conv = storage
+        .getConversations()
+        .find((c) => c.id === id);
+      const isMobile =
+        typeof window !== "undefined" && window.innerWidth < 768;
       if (conv?.type === "swarm") {
-        set({ activeConversationId: id, activeView: "research" as AppView, ...(isMobile ? { sidebarOpen: false } : {}) });
+        set({
+          activeConversationId: id,
+          activeView: "research" as AppView,
+          ...(isMobile ? { sidebarOpen: false } : {}),
+        });
         storage.setActiveView("research");
       } else {
-        set({ activeConversationId: id, activeView: "chat" as AppView, ...(isMobile ? { sidebarOpen: false } : {}) });
+        set({
+          activeConversationId: id,
+          activeView: "chat" as AppView,
+          ...(isMobile ? { sidebarOpen: false } : {}),
+        });
         storage.setActiveView("chat");
       }
     } else {
@@ -248,29 +292,36 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { activeConversationId } = get();
     if (activeConversationId === id) {
       storage.setActiveConversationId(null);
+      storage.setActiveView("home");
       set({
         conversations,
         activeConversationId: null,
         activeView: "home" as AppView,
       });
-      storage.setActiveView("home");
     } else {
       set({ conversations });
     }
   },
 
   updateSwarmOutput: (conversationId, output) => {
-    const conversations = storage.updateConversation(conversationId, { swarmOutput: output });
+    const conversations = storage.updateConversation(conversationId, {
+      swarmOutput: output,
+    });
     set({ conversations });
   },
 
   updateSwarmSteps: (conversationId, steps) => {
-    const conversations = storage.updateConversation(conversationId, { swarmSteps: steps });
+    const conversations = storage.updateConversation(conversationId, {
+      swarmSteps: steps,
+    });
     set({ conversations });
   },
 
   addMessage: (conversationId, message) => {
-    const conversations = storage.addMessageToConversation(conversationId, message);
+    const conversations = storage.addMessageToConversation(
+      conversationId,
+      message
+    );
     set({ conversations });
   },
 
@@ -281,6 +332,28 @@ export const useAppStore = create<AppState>((set, get) => ({
       content,
       thinking,
       tokenStats
+    );
+    set({ conversations });
+  },
+
+  updateMessageSearchResults: (
+    conversationId,
+    messageId,
+    searchResults,
+    searchQueries
+  ) => {
+    const conversations = storage.updateMessageInConversation(
+      conversationId,
+      messageId,
+      // Keep existing content
+      storage
+        .getConversations()
+        .find((c) => c.id === conversationId)
+        ?.messages.find((m) => m.id === messageId)?.content || "",
+      undefined,
+      undefined,
+      searchResults,
+      searchQueries
     );
     set({ conversations });
   },
@@ -333,7 +406,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { activeSearchProviderId } = get();
     set({
       searchProviders,
-      activeSearchProviderId: activeSearchProviderId === id ? null : activeSearchProviderId,
+      activeSearchProviderId:
+        activeSearchProviderId === id ? null : activeSearchProviderId,
     });
   },
 

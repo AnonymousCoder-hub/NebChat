@@ -1,3 +1,8 @@
+// ============================================================
+// NebChat — Type Definitions
+// ============================================================
+
+// --- Provider Types ---
 export interface APIProvider {
   id: string;
   name: string;
@@ -16,6 +21,7 @@ export interface ModelInfo {
   owned_by?: string;
 }
 
+// --- Chat Types ---
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
@@ -25,7 +31,9 @@ export interface Message {
   model?: string;
   providerId?: string;
   searchResults?: SearchResult[];
+  searchQueries?: string[];
   tokenStats?: TokenStats;
+  isStreaming?: boolean;
 }
 
 export interface Conversation {
@@ -56,6 +64,7 @@ export interface ChatRequestBody {
   max_tokens?: number;
   thinkingEnabled?: boolean;
   searchResults?: SearchResult[];
+  systemPrompt?: string;
 }
 
 export interface ModelsResponse {
@@ -69,15 +78,21 @@ export interface ModelsResponse {
 }
 
 // --- Search Types ---
-export type SearchProviderType = "duckduckgo" | "searxng" | "brave" | "serper" | "tavily" | "google_cse";
+export type SearchProviderType =
+  | "duckduckgo"
+  | "searxng"
+  | "brave"
+  | "serper"
+  | "tavily"
+  | "google_cse";
 
 export interface SearchProvider {
   id: string;
   name: string;
   type: SearchProviderType;
-  baseUrl?: string; // For SearXNG
+  baseUrl?: string;
   apiKey?: string;
-  cxId?: string; // For Google CSE
+  cxId?: string;
   isEnabled: boolean;
   addedAt: number;
 }
@@ -86,7 +101,7 @@ export interface SearchResult {
   title: string;
   url: string;
   snippet: string;
-  content?: string; // Full page content (fetched via page reader)
+  content?: string;
 }
 
 export interface SearchRequest {
@@ -103,8 +118,14 @@ export interface TokenStats {
   thinkingTokens?: number;
 }
 
-// --- Agent / Research Types ---
-export type AgentRole = "manager" | "researcher" | "analyst" | "writer" | "coder" | "custom";
+// --- Agent / Swarm Types ---
+export type AgentRole =
+  | "manager"
+  | "researcher"
+  | "analyst"
+  | "writer"
+  | "coder"
+  | "custom";
 
 export interface AgentConfig {
   id: string;
@@ -115,12 +136,19 @@ export interface AgentConfig {
   providerId: string;
   searchEnabled: boolean;
   searchLimit: number;
-  priority: number; // Higher = processes later (closer to final output)
-  thinkingEnabled: boolean; // Per-agent thinking toggle
-  maxIterations: number; // Max agentic loop iterations for this agent (0 = unlimited)
+  priority: number;
+  thinkingEnabled: boolean;
+  maxIterations: number;
 }
 
-export type AgentStatus = "idle" | "thinking" | "searching" | "reading" | "writing" | "done" | "error";
+export type AgentStatus =
+  | "idle"
+  | "thinking"
+  | "searching"
+  | "reading"
+  | "writing"
+  | "done"
+  | "error";
 
 export interface AgentState {
   config: AgentConfig;
@@ -133,29 +161,44 @@ export interface AgentState {
   tokenStats?: TokenStats;
 }
 
-export type ResearchStatus = "idle" | "running" | "paused" | "completed" | "error";
+export type ResearchStatus =
+  | "idle"
+  | "running"
+  | "paused"
+  | "completed"
+  | "error";
 
-// --- Swarm Step (ReAct loop) ---
-// Each step represents one action in the agentic loop
-export type SwarmStepType = "thinking" | "searching" | "reading" | "writing" | "final" | "error" | "user_intervention" | "delegating" | "synthesizing" | "waiting_for_user" | "chat";
+// --- Swarm Step Types ---
+export type SwarmStepType =
+  | "thinking"
+  | "searching"
+  | "reading"
+  | "writing"
+  | "final"
+  | "error"
+  | "user_intervention"
+  | "delegating"
+  | "synthesizing"
+  | "waiting_for_user"
+  | "chat";
 
 export interface SwarmStep {
   id: string;
   agentId: string;
   agentName: string;
   type: SwarmStepType;
-  title: string; // Short description e.g. "Searching for: best AI stocks"
-  content: string; // Full content (search results, page content, agent output, etc.)
-  thinking?: string; // Agent's thinking during this step
+  title: string;
+  content: string;
+  thinking?: string;
   timestamp: number;
-  urls?: string[]; // URLs involved (for search/read steps)
-  searchResults?: SearchResult[]; // For search steps
-  duration?: number; // Time taken in ms
+  urls?: string[];
+  searchResults?: SearchResult[];
+  duration?: number;
 }
 
 export interface SwarmConfig {
   topic: string;
-  maxSteps: number; // 0 = unlimited; overall limit for the entire swarm
+  maxSteps: number;
   agents: AgentConfig[];
 }
 
@@ -172,10 +215,20 @@ export interface ResearchSession {
   steps: SwarmStep[];
 }
 
+// --- Todo Types for Swarm ---
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  assignedTo?: string;
+  result?: string;
+}
+
+// --- Research Message ---
 export interface ResearchMessage {
   id: string;
   fromAgentId: string;
-  toAgentId: string | null; // null = broadcast
+  toAgentId: string | null;
   content: string;
   timestamp: number;
   type: "thinking" | "output" | "search" | "instruction" | "question" | "final";

@@ -6,29 +6,44 @@ const STORAGE_KEYS = {
   ACTIVE_VIEW: "nebchat_active_view",
   ACTIVE_CONVERSATION: "nebchat_active_conversation",
   SELECTED_MODEL: "nebchat_selected_model",
-  SELECTED_PROVIDER: "nebchat_selected_provider",
   THINKING_ENABLED: "nebchat_thinking_enabled",
   SEARCH_ENABLED: "nebchat_search_enabled",
   SEARCH_PROVIDERS: "nebchat_search_providers",
   ACTIVE_SEARCH_PROVIDER: "nebchat_active_search_provider",
-  RESEARCH_SESSIONS: "nebchat_research_sessions",
   PAGE_READER_URL: "nebchat_page_reader_url",
 } as const;
 
-// --- Providers ---
-export function getProviders(): APIProvider[] {
-  if (typeof window === "undefined") return [];
+function safeGet<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
   try {
-    const data = localStorage.getItem(STORAGE_KEYS.PROVIDERS);
-    return data ? JSON.parse(data) : [];
+    const data = localStorage.getItem(key);
+    return data ? JSON.parse(data) : fallback;
   } catch {
-    return [];
+    return fallback;
   }
 }
 
-export function saveProviders(providers: APIProvider[]): void {
+function safeSet(key: string, value: unknown): void {
   if (typeof window === "undefined") return;
-  localStorage.setItem(STORAGE_KEYS.PROVIDERS, JSON.stringify(providers));
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // localStorage might be full
+  }
+}
+
+function safeGetString(key: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  return localStorage.getItem(key) || fallback;
+}
+
+// --- Providers ---
+export function getProviders(): APIProvider[] {
+  return safeGet<APIProvider[]>(STORAGE_KEYS.PROVIDERS, []);
+}
+
+export function saveProviders(providers: APIProvider[]): void {
+  safeSet(STORAGE_KEYS.PROVIDERS, providers);
 }
 
 export function addProvider(provider: APIProvider): APIProvider[] {
@@ -38,7 +53,10 @@ export function addProvider(provider: APIProvider): APIProvider[] {
   return providers;
 }
 
-export function updateProvider(id: string, updates: Partial<APIProvider>): APIProvider[] {
+export function updateProvider(
+  id: string,
+  updates: Partial<APIProvider>
+): APIProvider[] {
   const providers = getProviders();
   const index = providers.findIndex((p) => p.id === id);
   if (index !== -1) {
@@ -59,18 +77,11 @@ export function removeProvider(id: string): APIProvider[] {
 
 // --- Conversations ---
 export function getConversations(): Conversation[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const data = localStorage.getItem(STORAGE_KEYS.CONVERSATIONS);
-    return data ? JSON.parse(data) : [];
-  } catch {
-    return [];
-  }
+  return safeGet<Conversation[]>(STORAGE_KEYS.CONVERSATIONS, []);
 }
 
 export function saveConversations(conversations: Conversation[]): void {
-  if (typeof window === "undefined") return;
-  localStorage.setItem(STORAGE_KEYS.CONVERSATIONS, JSON.stringify(conversations));
+  safeSet(STORAGE_KEYS.CONVERSATIONS, conversations);
 }
 
 export function addConversation(conversation: Conversation): Conversation[] {
@@ -80,7 +91,10 @@ export function addConversation(conversation: Conversation): Conversation[] {
   return conversations;
 }
 
-export function updateConversation(id: string, updates: Partial<Conversation>): Conversation[] {
+export function updateConversation(
+  id: string,
+  updates: Partial<Conversation>
+): Conversation[] {
   const conversations = getConversations();
   const index = conversations.findIndex((c) => c.id === id);
   if (index !== -1) {
@@ -96,7 +110,10 @@ export function removeConversation(id: string): Conversation[] {
   return conversations;
 }
 
-export function addMessageToConversation(conversationId: string, message: Message): Conversation[] {
+export function addMessageToConversation(
+  conversationId: string,
+  message: Message
+): Conversation[] {
   const conversations = getConversations();
   const index = conversations.findIndex((c) => c.id === conversationId);
   if (index !== -1) {
@@ -108,7 +125,8 @@ export function addMessageToConversation(conversationId: string, message: Messag
       message.role === "user"
     ) {
       conversations[index].title =
-        message.content.slice(0, 50) + (message.content.length > 50 ? "..." : "");
+        message.content.slice(0, 50) +
+        (message.content.length > 50 ? "..." : "");
     }
     saveConversations(conversations);
   }
@@ -120,23 +138,36 @@ export function updateMessageInConversation(
   messageId: string,
   content: string,
   thinking?: string,
-  tokenStats?: { totalTokens: number; totalTimeMs: number; tokensPerSecond: number; thinkingTokens?: number }
+  tokenStats?: {
+    totalTokens: number;
+    totalTimeMs: number;
+    tokensPerSecond: number;
+    thinkingTokens?: number;
+  },
+  searchResults?: { title: string; url: string; snippet: string; content?: string }[],
+  searchQueries?: string[]
 ): Conversation[] {
   const conversations = getConversations();
-  const index = conversations.findIndex((c) => c.id === conversationId);
-  if (index !== -1) {
-    const msgIndex = conversations[index].messages.findIndex(
+  const convIndex = conversations.findIndex((c) => c.id === conversationId);
+  if (convIndex !== -1) {
+    const msgIndex = conversations[convIndex].messages.findIndex(
       (m) => m.id === messageId
     );
     if (msgIndex !== -1) {
-      conversations[index].messages[msgIndex].content = content;
+      conversations[convIndex].messages[msgIndex].content = content;
       if (thinking !== undefined) {
-        conversations[index].messages[msgIndex].thinking = thinking;
+        conversations[convIndex].messages[msgIndex].thinking = thinking;
       }
       if (tokenStats) {
-        conversations[index].messages[msgIndex].tokenStats = tokenStats;
+        conversations[convIndex].messages[msgIndex].tokenStats = tokenStats;
       }
-      conversations[index].updatedAt = Date.now();
+      if (searchResults) {
+        conversations[convIndex].messages[msgIndex].searchResults = searchResults;
+      }
+      if (searchQueries) {
+        conversations[convIndex].messages[msgIndex].searchQueries = searchQueries;
+      }
+      conversations[convIndex].updatedAt = Date.now();
       saveConversations(conversations);
     }
   }
@@ -145,8 +176,7 @@ export function updateMessageInConversation(
 
 // --- UI State ---
 export function getActiveView(): string {
-  if (typeof window === "undefined") return "home";
-  return localStorage.getItem(STORAGE_KEYS.ACTIVE_VIEW) || "home";
+  return safeGetString(STORAGE_KEYS.ACTIVE_VIEW, "home");
 }
 
 export function setActiveView(view: string): void {
@@ -168,22 +198,21 @@ export function setActiveConversationId(id: string | null): void {
   }
 }
 
-export function getSelectedModel(): { modelId: string; providerId: string } | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const data = localStorage.getItem(STORAGE_KEYS.SELECTED_MODEL);
-    return data ? JSON.parse(data) : null;
-  } catch {
-    return null;
-  }
+export function getSelectedModel(): {
+  modelId: string;
+  providerId: string;
+} | null {
+  return safeGet<{ modelId: string; providerId: string } | null>(
+    STORAGE_KEYS.SELECTED_MODEL,
+    null
+  );
 }
 
-export function setSelectedModel(modelId: string, providerId: string): void {
-  if (typeof window === "undefined") return;
-  localStorage.setItem(
-    STORAGE_KEYS.SELECTED_MODEL,
-    JSON.stringify({ modelId, providerId })
-  );
+export function setSelectedModel(
+  modelId: string,
+  providerId: string
+): void {
+  safeSet(STORAGE_KEYS.SELECTED_MODEL, { modelId, providerId });
 }
 
 // --- Thinking Toggle ---
@@ -210,18 +239,11 @@ export function setSearchEnabled(enabled: boolean): void {
 
 // --- Search Providers ---
 export function getSearchProviders(): SearchProvider[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const data = localStorage.getItem(STORAGE_KEYS.SEARCH_PROVIDERS);
-    return data ? JSON.parse(data) : [];
-  } catch {
-    return [];
-  }
+  return safeGet<SearchProvider[]>(STORAGE_KEYS.SEARCH_PROVIDERS, []);
 }
 
 export function saveSearchProviders(providers: SearchProvider[]): void {
-  if (typeof window === "undefined") return;
-  localStorage.setItem(STORAGE_KEYS.SEARCH_PROVIDERS, JSON.stringify(providers));
+  safeSet(STORAGE_KEYS.SEARCH_PROVIDERS, providers);
 }
 
 export function addSearchProvider(provider: SearchProvider): SearchProvider[] {
@@ -231,7 +253,10 @@ export function addSearchProvider(provider: SearchProvider): SearchProvider[] {
   return providers;
 }
 
-export function updateSearchProvider(id: string, updates: Partial<SearchProvider>): SearchProvider[] {
+export function updateSearchProvider(
+  id: string,
+  updates: Partial<SearchProvider>
+): SearchProvider[] {
   const providers = getSearchProviders();
   const index = providers.findIndex((p) => p.id === id);
   if (index !== -1) {
