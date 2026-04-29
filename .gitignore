@@ -1,5 +1,3 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
 # dependencies
 node_modules
 /.pnp
@@ -30,25 +28,32 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files
 .env*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # vercel
 .vercel
 
-
 # typescript
 *.tsbuildinfo
 next-env.d.ts
-local-*
-.claude
-.z-ai-config
-*.log
+
+# database
+db/
+*.db
+
+# z.ai specific (not part of NebChat)
+.zscripts/
+skills/
+mini-services/
+examples/
+download/
+upload/
+Caddyfile
+worklog.md
 dev.log
 dev.out.log
-test
-prompt
-
-server.log
-# Skills directory
-/skills/
