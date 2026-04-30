@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NebChat v5.4 — Ollama + Playwright + Flask Bridge + ngrok
-Playwright ONLY for search & content. Thread-safe async design.
+NebChat v6.0 — Ollama + Playwright + Flask Bridge + ngrok
+Playwright ONLY for search & content. Thread-safe.
 Paste this ENTIRE script in a single Colab cell and run.
 """
 
@@ -11,43 +11,27 @@ import subprocess
 
 # ─────────────────────────────────────────────
 # STEP 1: Install Python packages FIRST
-# (must happen before any imports that need them)
 # ─────────────────────────────────────────────
 def install_deps():
     """Install Python packages needed before we import them."""
     print("📦 Installing Python packages...")
-
-    pip_pkgs = [
-        "flask",
-        "flask-cors",
-        "pyngrok",
-        "requests",
-        "playwright",
-    ]
+    pip_pkgs = ["flask", "flask-cors", "pyngrok", "requests", "playwright"]
     for pkg in pip_pkgs:
         mod_name = pkg.replace("-", "_")
         try:
             __import__(mod_name)
-            print(f"  ✅ {pkg} already installed")
+            print(f"  ✅ {pkg}")
         except ImportError:
-            print(f"  ⬇️ Installing {pkg}...")
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-q", pkg],
-                check=True,
-            )
-
+            print(f"  ⬇️ {pkg}...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
     print("✅ Python packages ready!\n")
 
 
-# ═══════════════════════════════════════════════
-# RUN install_deps() AT MODULE LEVEL NOW
-# This guarantees packages are installed BEFORE
-# the imports below this line execute.
-# ═══════════════════════════════════════════════
+# Run install at module level before other imports
 install_deps()
 
 # ─────────────────────────────────────────────
-# STEP 2: NOW we can safely import everything
+# STEP 2: Safe imports
 # ─────────────────────────────────────────────
 import json
 import asyncio
@@ -91,29 +75,40 @@ OLLAMA_ENV = {
     "OLLAMA_CONTEXT_LENGTH": "8192",
 }
 
+# Chromium launch flags that actually work on Colab containers
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--remote-debugging-port=9222",
+]
+
 
 # ─────────────────────────────────────────────
 # OLLAMA MANAGEMENT
 # ─────────────────────────────────────────────
 def install_system_deps():
-    """Install system-level deps (zstd, ollama). Fast if already present."""
+    """Install system-level deps."""
     if not os.path.exists("/usr/bin/zstd"):
-        print("  ⬇️ Installing zstd...")
+        print("  ⬇️ zstd...")
         os.system("apt-get update -yqq && apt-get install -yqq zstd")
     else:
-        print("  ✅ zstd ready")
+        print("  ✅ zstd")
 
     if not os.path.exists("/usr/local/bin/ollama"):
-        print("  ⬇️ Installing Ollama...")
+        print("  ⬇️ Ollama...")
         os.system("curl -fsSL https://ollama.com/install.sh | sh")
         os.environ["PATH"] += ":/usr/local/bin"
     else:
-        print("  ✅ Ollama ready")
+        print("  ✅ Ollama")
 
 
 def cleanup_old_processes():
-    """Kill any leftover processes from previous runs."""
-    print("🧹 Cleaning up old processes...")
+    """Kill leftover processes."""
+    print("🧹 Cleaning up...")
     for proc in ["ollama", "ngrok", "nebchat"]:
         os.system(f"pkill -9 -f {proc} 2>/dev/null")
     for port in [OLLAMA_PORT, BRIDGE_PORT]:
@@ -122,7 +117,7 @@ def cleanup_old_processes():
 
 
 def start_ollama():
-    """Start Ollama server and wait for it to be ready."""
+    """Start Ollama server and wait for ready."""
     env = os.environ.copy()
     env.update(OLLAMA_ENV)
     print("🚀 Starting Ollama...")
@@ -135,7 +130,7 @@ def start_ollama():
     for _ in range(30):
         try:
             req_lib.get(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=2)
-            print("✅ Ollama is running!\n")
+            print("✅ Ollama running!\n")
             return
         except Exception:
             time.sleep(1)
@@ -143,7 +138,7 @@ def start_ollama():
 
 
 def ensure_models():
-    """Pull required models if not already present."""
+    """Pull required models if missing."""
     print("📥 Checking models...")
     try:
         existing = [
@@ -152,13 +147,12 @@ def ensure_models():
         ]
     except Exception:
         existing = []
-
     for model in MODELS:
         if not any(model in x for x in existing):
-            print(f"  ⬇️ Pulling {model}...")
+            print(f"  ⬇️ {model}...")
             subprocess.run(["ollama", "pull", model], check=True)
         else:
-            print(f"  ✅ {model} ready")
+            print(f"  ✅ {model}")
 
 
 def warmup_models():
@@ -173,7 +167,7 @@ def warmup_models():
             )
         except Exception:
             pass
-    print("✅ Models warmed up!\n")
+    print("✅ Models warm!\n")
 
 
 # ─────────────────────────────────────────────
@@ -196,121 +190,180 @@ def log_request():
 
 
 # ─────────────────────────────────────────────
-# PLAYWRIGHT — the ONLY engine (LAZY + THREAD-SAFE)
+# PLAYWRIGHT — Thread-safe async browser
 # ─────────────────────────────────────────────
-# Browser is NOT launched at startup. It initializes lazily on the
-# first search/read request. This way the server starts instantly.
-#
-# Playwright runs in a dedicated thread with its own asyncio event loop.
-# Flask threads submit coroutines via asyncio.run_coroutine_threadsafe().
-
-_pw_loop = None           # asyncio event loop (in PW thread)
-_pw_browser = None        # single shared browser instance
-_pw_init_lock = threading.Lock()
-_pw_initialized = False
+_pw_loop = None
+_pw_browser = None
+_pw_playwright = None  # keep reference alive
+_pw_lock = threading.Lock()
 
 
-def _ensure_playwright():
-    """Initialize Playwright if not already done. Thread-safe, idempotent."""
-    global _pw_loop, _pw_browser, _pw_initialized
+def init_playwright():
+    """Install Chromium + launch browser. Called during startup."""
+    global _pw_loop, _pw_browser, _pw_playwright
 
-    if _pw_initialized and _pw_browser is not None:
-        return True  # already running
+    # Step 1: Install Chromium binary
+    print("  ⬇️ Installing Chromium...")
+    r = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True, text=True, timeout=300,
+    )
+    if r.returncode != 0:
+        print(f"  ⚠️ Chromium install issue: {r.stderr[:300]}")
+    else:
+        print("  ✅ Chromium installed")
 
-    with _pw_init_lock:
-        if _pw_initialized and _pw_browser is not None:
-            return True
+    # Step 2: Install system deps for Chromium
+    print("  ⬇️ System deps for Chromium (this takes a few minutes on first run)...")
+    r = subprocess.run(
+        [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+        capture_output=True, text=True, timeout=600,
+    )
+    if r.returncode != 0:
+        print(f"  ⚠️ Deps issue: {r.stderr[:300]}")
+    else:
+        print("  ✅ System deps installed")
 
-        print("🌐 Initializing Playwright (first request)...", flush=True)
+    # Step 3: Launch browser in a dedicated thread with its own asyncio loop
+    print("  🌐 Launching browser...")
+    ready = threading.Event()
+    error_holder = [None]
 
-        # Step 1: Install Chromium browser binary if needed
-        print("  ⬇️ Installing Chromium browser...", flush=True)
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"  ⚠️ Chromium install: {result.stderr[:200]}", flush=True)
-        else:
-            print("  ✅ Chromium browser installed", flush=True)
+    def _run_loop():
+        global _pw_loop, _pw_browser, _pw_playwright
 
-        # Step 2: Install system dependencies for Chromium
-        print("  ⬇️ Installing system deps for Chromium...", flush=True)
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install-deps", "chromium"],
-            capture_output=True, text=True, timeout=600,
-        )
-        if result.returncode != 0:
-            print(f"  ⚠️ System deps: {result.stderr[:200]}", flush=True)
-        else:
-            print("  ✅ System deps installed", flush=True)
+        async def _launch():
+            global _pw_browser, _pw_playwright
+            from playwright.async_api import async_playwright
 
-        # Step 3: Launch browser in a dedicated thread
-        pw_ready = threading.Event()
-        pw_error = [None]
+            _pw_playwright = await async_playwright().start()
+            _pw_browser = await _pw_playwright.chromium.launch(
+                headless=True,
+                args=CHROMIUM_ARGS,
+            )
+            ready.set()
+            # Keep loop alive
+            while True:
+                await asyncio.sleep(3600)
 
-        def _pw_thread_main():
-            global _pw_loop, _pw_browser
+        _pw_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_pw_loop)
+        try:
+            _pw_loop.run_until_complete(_launch())
+        except Exception as e:
+            error_holder[0] = str(e)
+            ready.set()
 
-            async def _start_browser():
-                global _pw_browser
-                from playwright.async_api import async_playwright
+    t = threading.Thread(target=_run_loop, daemon=True)
+    t.start()
+    ready.wait(timeout=30)
 
-                pw = await async_playwright().start()
-                _pw_browser = await pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--disable-extensions",
-                        "--single-process",
-                    ],
-                )
-                print("  ✅ Browser launched!", flush=True)
-                pw_ready.set()
+    if _pw_browser is None:
+        err = error_holder[0] or "timeout"
+        print(f"  ❌ Browser launch failed: {err}")
+        return False
 
-                # Keep the loop alive forever
-                while True:
-                    await asyncio.sleep(3600)
+    # Step 4: Quick test — open a page and close it
+    print("  🧪 Testing browser...", flush=True)
+    try:
+        future = asyncio.run_coroutine_threadsafe(_test_browser(), _pw_loop)
+        future.result(timeout=20)
+        print("  ✅ Browser test passed!\n")
+        return True
+    except Exception as e:
+        print(f"  ❌ Browser test failed: {e}")
+        print("  🔄 Retrying with different settings...")
+        return _retry_launch()
 
+
+async def _test_browser():
+    """Open a simple page to verify the browser works."""
+    ctx = await _pw_browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 720},
+    )
+    page = await ctx.new_page()
+    await page.goto("https://www.example.com", timeout=15000, wait_until="domcontentloaded")
+    title = await page.title()
+    await ctx.close()
+    print(f"     Page title: {title}")
+
+
+def _retry_launch():
+    """Retry with simpler args if default launch fails."""
+    global _pw_loop, _pw_browser, _pw_playwright
+
+    # Close old browser if any
+    if _pw_browser:
+        try:
+            future = asyncio.run_coroutine_threadsafe(_pw_browser.close(), _pw_loop)
+            future.result(timeout=5)
+        except Exception:
+            pass
+
+    ready = threading.Event()
+    error_holder = [None]
+
+    # Fallback: minimal args
+    fallback_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+    def _run_fallback():
+        global _pw_loop, _pw_browser, _pw_playwright
+
+        async def _launch():
+            global _pw_browser, _pw_playwright
+            from playwright.async_api import async_playwright
+
+            _pw_playwright = await async_playwright().start()
+            _pw_browser = await _pw_playwright.chromium.launch(
+                headless=True,
+                args=fallback_args,
+            )
+            ready.set()
+            while True:
+                await asyncio.sleep(3600)
+
+        # Reuse existing loop or create new one
+        if _pw_loop is None or _pw_loop.is_closed():
             _pw_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(_pw_loop)
-            try:
-                _pw_loop.run_until_complete(_start_browser())
-            except Exception as e:
-                pw_error[0] = str(e)
-                print(f"  ❌ Browser launch failed: {e}", flush=True)
-                pw_ready.set()
+        try:
+            _pw_loop.run_until_complete(_launch())
+        except Exception as e:
+            error_holder[0] = str(e)
+            ready.set()
 
-        pw_thread = threading.Thread(target=_pw_thread_main, daemon=True)
-        pw_thread.start()
-        pw_ready.wait(timeout=60)
+    t = threading.Thread(target=_run_fallback, daemon=True)
+    t.start()
+    ready.wait(timeout=30)
 
-        if _pw_browser is not None:
-            _pw_initialized = True
-            print("✅ Playwright ready!\n", flush=True)
-            return True
-        else:
-            err = pw_error[0] or "timeout"
-            print(f"❌ Playwright failed: {err}\n", flush=True)
-            _pw_initialized = True  # don't retry forever
-            return False
+    if _pw_browser is None:
+        print(f"  ❌ Retry also failed: {error_holder[0]}")
+        return False
+
+    # Test again
+    try:
+        future = asyncio.run_coroutine_threadsafe(_test_browser(), _pw_loop)
+        future.result(timeout=20)
+        print("  ✅ Browser works with fallback settings!\n")
+        return True
+    except Exception as e:
+        print(f"  ❌ Browser test still failing: {e}")
+        return False
 
 
 def _pw_submit(coro):
-    """Submit an async coroutine to the Playwright event loop, wait for result."""
+    """Submit an async coroutine to the PW event loop, wait for result."""
     if _pw_loop is None or _pw_browser is None:
         raise RuntimeError("Playwright not initialized")
     future = asyncio.run_coroutine_threadsafe(coro, _pw_loop)
     return future.result(timeout=120)
 
 
-# ── Async Playwright operations (run on PW thread) ──
+# ── Async search & read ──
 
 async def _async_search(query, max_results=10):
-    """Search Bing via Playwright (async, runs on PW thread)."""
+    """Search Bing via Playwright."""
     ctx = None
     try:
         ctx = await _pw_browser.new_context(
@@ -319,14 +372,14 @@ async def _async_search(query, max_results=10):
             locale="en-US",
         )
         page = await ctx.new_page()
-        search_url = (
+        url = (
             f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
             f"&count={max_results}&setlang=en&cc=US"
         )
-        await page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+        await page.goto(url, timeout=15000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
-        # Check for captcha
+        # Captcha check
         is_captcha = await page.evaluate(
             "() => {"
             "  const t = document.body.innerText || '';"
@@ -335,7 +388,7 @@ async def _async_search(query, max_results=10):
         )
         if is_captcha:
             await ctx.close()
-            return json.dumps({"error": "Captcha detected — try again later"})
+            return json.dumps({"error": "Captcha detected"})
 
         # Extract results
         results = await page.evaluate(
@@ -370,7 +423,7 @@ async def _async_search(query, max_results=10):
 
 
 async def _async_read_page(url, max_chars=8000):
-    """Read any webpage via Playwright (async, runs on PW thread)."""
+    """Read any webpage via Playwright."""
     ctx = None
     try:
         ctx = await _pw_browser.new_context(
@@ -422,12 +475,12 @@ async def _async_read_page(url, max_chars=8000):
     return "Failed to read page."
 
 
-# ── Public sync wrappers (called from Flask threads) ──
+# ── Public sync wrappers ──
 
 def search_web(query, max_results=10):
-    """Search Bing via Playwright. Thread-safe. Auto-inits if needed."""
+    """Search Bing. Thread-safe wrapper."""
     try:
-        if not _ensure_playwright():
+        if _pw_browser is None:
             return json.dumps({"error": "Browser not available"})
         return _pw_submit(_async_search(query, max_results))
     except Exception as e:
@@ -436,9 +489,9 @@ def search_web(query, max_results=10):
 
 
 def read_page(url, max_chars=8000):
-    """Read any webpage via Playwright. Thread-safe. Auto-inits if needed."""
+    """Read any webpage. Thread-safe wrapper."""
     try:
-        if not _ensure_playwright():
+        if _pw_browser is None:
             return "Browser not available"
         return _pw_submit(_async_read_page(url, max_chars))
     except Exception as e:
@@ -446,13 +499,8 @@ def read_page(url, max_chars=8000):
         return f"Read error: {e}"
 
 
-def get_browser_status():
-    """Check if Playwright browser is alive (for /health endpoint)."""
-    return _pw_browser is not None
-
-
 def execute_tool(name, args):
-    """Dispatch a tool call to the right function."""
+    """Dispatch a tool call."""
     if name == "web_search":
         return search_web(args.get("query", ""))
     if name == "read_page":
@@ -532,7 +580,6 @@ def handle_agentic(body, stream):
     messages = list(body.get("messages", []))
     model = body.get("model", "qwen3:8b")
 
-    # Inject system prompt
     has_system = any(m.get("role") == "system" for m in messages)
     if not has_system:
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
@@ -606,7 +653,6 @@ def handle_agentic(body, stream):
 
                 print(f"[AG] R{round_num+1}: {tool_name}({json.dumps(tool_args)[:60]})", flush=True)
 
-                # Stream activity events to the client
                 if tool_name == "web_search":
                     yield make_sse_chunk(chat_id, created, model, {
                         "content": "",
@@ -626,10 +672,8 @@ def handle_agentic(body, stream):
                         },
                     })
 
-                # Execute the tool
                 result = execute_tool(tool_name, tool_args)
 
-                # Stream result events
                 if tool_name == "web_search":
                     try:
                         parsed = json.loads(result)
@@ -660,7 +704,6 @@ def handle_agentic(body, stream):
                     "content": result,
                 })
 
-        # Stream the final response
         content = resp["choices"][0]["message"].get("content", "") if resp else ""
         thinking = resp["choices"][0]["message"].get("reasoning_content", "") if resp else ""
 
@@ -674,7 +717,6 @@ def handle_agentic(body, stream):
                 delta["role"] = "assistant"
             yield make_sse_chunk(chat_id, created, model, delta)
 
-        # Final chunk with finish_reason
         final = {
             "id": chat_id,
             "object": "chat.completion.chunk",
@@ -693,10 +735,10 @@ def handle_agentic(body, stream):
 
 
 # ─────────────────────────────────────────────
-# STREAM PROXY (for non-agentic requests)
+# STREAM PROXY
 # ─────────────────────────────────────────────
 def proxy_request(url, method, headers, body):
-    """Proxy a request to Ollama, handling both SSE and regular responses."""
+    """Proxy a request to Ollama."""
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
     try:
@@ -713,7 +755,6 @@ def proxy_request(url, method, headers, body):
 
     content_type = resp.headers.get("Content-Type", "application/octet-stream")
 
-    # SSE stream — read in background thread, yield from queue
     if "text/event-stream" in content_type:
         data_queue = queue.Queue()
         done_event = threading.Event()
@@ -756,7 +797,6 @@ def proxy_request(url, method, headers, body):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # Regular response
     def regular_generator():
         try:
             while True:
@@ -780,7 +820,7 @@ def proxy_request(url, method, headers, body):
 # ─────────────────────────────────────────────
 @app.route("/")
 def index():
-    return jsonify({"name": "NebChat", "v": "5.4", "engine": "Playwright"})
+    return jsonify({"name": "NebChat", "v": "6.0", "engine": "Playwright"})
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -789,10 +829,7 @@ def list_models():
         models = req_lib.get(f"{OLLAMA_URL}/api/tags", timeout=5).json().get("models", [])
         return jsonify({
             "object": "list",
-            "data": [
-                {"id": m["name"], "object": "model", "owned_by": "ollama"}
-                for m in models
-            ],
+            "data": [{"id": m["name"], "object": "model", "owned_by": "ollama"} for m in models],
         })
     except Exception:
         return jsonify({"object": "list", "data": []})
@@ -804,7 +841,6 @@ def chat_completions():
     stream = body.get("stream", False)
     messages = body.get("messages", [])
 
-    # Detect agentic requests
     has_agentic_prompt = any(
         m.get("role") == "system" and (
             "search" in m.get("content", "").lower()
@@ -825,7 +861,6 @@ def chat_completions():
     if has_agentic_prompt or auto_agentic:
         return handle_agentic(body, stream)
 
-    # Non-agentic: just proxy to Ollama
     if stream:
         qs = request.query_string.decode("utf-8")
         target = f"{OLLAMA_URL}/v1/chat/completions" + (f"?{qs}" if qs else "")
@@ -879,11 +914,10 @@ def health():
         ollama_ok = req_lib.get(f"{OLLAMA_URL}/api/tags", timeout=3).ok
     except Exception:
         pass
-    playwright_ok = _pw_initialized and _pw_browser is not None
     return jsonify({
         "status": "ok" if ollama_ok else "degraded",
         "ollama": ollama_ok,
-        "playwright": playwright_ok,
+        "playwright": _pw_browser is not None,
     })
 
 
@@ -926,17 +960,22 @@ def monitor(interval=120):
 
 
 if __name__ == "__main__":
-    # Step 1: System deps (fast if already installed)
+    # Step 1: System deps
     print("📦 System dependencies...")
     install_system_deps()
 
-    # Step 2: Clean up, start Ollama
+    # Step 2: Clean up + start Ollama
     cleanup_old_processes()
     start_ollama()
     ensure_models()
     warmup_models()
 
-    # Step 3: Start server (Playwright initializes lazily on first search)
-    print("💡 Server starting — Playwright will initialize on first search request\n")
+    # Step 3: Initialize Playwright DURING SETUP (not lazy)
+    print("🌐 Setting up Playwright...")
+    pw_ok = init_playwright()
+    if not pw_ok:
+        print("⚠️  Playwright failed — search won't work, but chat will.\n")
+
+    # Step 4: Start server
     threading.Thread(target=monitor, daemon=True).start()
     start_bridge()
