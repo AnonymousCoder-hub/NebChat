@@ -1,136 +1,396 @@
 #!/usr/bin/env python3
-# NebChat v5.1 — Ollama + Playwright + Flask Bridge + ngrok
-# Playwright ONLY for search & content. No Crawl4AI, no callbacks, no fallbacks.
-# Paste this ENTIRE script in a single Colab cell and run.
+"""
+NebChat v5.2 — Ollama + Playwright + Flask Bridge + ngrok
+Playwright ONLY for search & content. No fallbacks, no bloat.
+Paste this ENTIRE script in a single Colab cell and run.
+"""
 
-import os,sys,time,json,subprocess,threading,queue,shutil,urllib.request,urllib.error,urllib.parse
-# Auto-install deps BEFORE importing them (Colab doesn't have these pre-installed)
-for _p in ["flask","flask-cors","pyngrok","requests"]:
-    try: __import__(_p.split("-")[0].replace("-","_"))
-    except: subprocess.run([sys.executable,"-m","pip","install","-q",_p],check=True)
-from datetime import datetime,timezone
-from flask import Flask,Response,request,jsonify,stream_with_context
+import os
+import sys
+import subprocess
+
+# ─────────────────────────────────────────────
+# STEP 1: Install ALL dependencies FIRST
+# (must happen before any imports that need them)
+# ─────────────────────────────────────────────
+def install_deps():
+    """Install everything needed before we import anything."""
+    print("📦 Installing dependencies...")
+
+    # System deps
+    if not os.path.exists("/usr/bin/zstd"):
+        os.system("apt-get update -y && apt-get install -y zstd")
+
+    # Python packages
+    pip_pkgs = [
+        "flask",
+        "flask-cors",
+        "pyngrok",
+        "requests",
+        "playwright",
+    ]
+    for pkg in pip_pkgs:
+        mod_name = pkg.replace("-", "_")
+        try:
+            __import__(mod_name)
+            print(f"  ✅ {pkg} already installed")
+        except ImportError:
+            print(f"  ⬇️ Installing {pkg}...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", pkg],
+                check=True,
+            )
+
+    # Playwright browser + system deps
+    print("📦 Setting up Playwright browser...")
+    os.system("playwright install chromium 2>/dev/null || true")
+    os.system("playwright install-deps chromium 2>/dev/null || true")
+
+    # Ollama
+    if not os.path.exists("/usr/local/bin/ollama"):
+        print("⬇️ Installing Ollama...")
+        os.system("curl -fsSL https://ollama.com/install.sh | sh")
+        os.environ["PATH"] += ":/usr/local/bin"
+    else:
+        print("  ✅ Ollama already installed")
+
+    print("✅ All dependencies ready!\n")
+
+
+# ─────────────────────────────────────────────
+# STEP 2: NOW we can safely import everything
+# ─────────────────────────────────────────────
+import json
+import time
+import shutil
+import queue
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+from datetime import datetime, timezone
+
+from flask import Flask, Response, request, jsonify, stream_with_context
 from flask_cors import CORS
 import requests as req_lib
 
-# ── CONFIG ──
-NGROK_TOKEN="YOUR_NGROK_AUTH_TOKEN_HERE"  # <-- Replace!
-P_OL,P_BR=11434,5000; MODELS=["qwen3.5:9b","qwen3.5:0.8b"]
-OL_ENV={"OLLAMA_KEEP_ALIVE":"-1","OLLAMA_NUM_PARALLEL":"4","OLLAMA_MAX_LOADED_MODELS":"3","OLLAMA_GPU_LAYERS":"999","OLLAMA_FLASH_ATTENTION":"1","OLLAMA_KV_CACHE_TYPE":"q8_0","OLLAMA_CONTEXT_LENGTH":"8192"}
-OL=f"http://localhost:{P_OL}"; MAXR=10
-UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
-# ── SETUP ──
-def setup():
-    print("📦 Setup...")
-    if not shutil.which("zstd"): os.system("apt-get update -y && apt-get install -y zstd")
-    for p in ["flask flask-cors pyngrok","requests"]:
-        try: __import__(p.split()[0].replace("-","_"))
-        except: os.system(f"pip install -q {p}")
-    try: from playwright.async_api import async_playwright
-    except: os.system("pip install -q playwright")
-    os.system("playwright install chromium 2>/dev/null || pip install -q playwright && playwright install chromium")
-    os.system("playwright install-deps chromium 2>/dev/null || true")
-    if not shutil.which("ollama"): os.system("curl -fsSL https://ollama.com/install.sh | sh"); os.environ["PATH"]+=":/usr/local/bin"
-    print("✅ Ready")
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+NGROK_TOKEN = "3CPKOAZmMaygc9VlRuHwSXcOXNe_7apUcU4vTgGZ7V3Vttr6T"
+OLLAMA_PORT = 11434
+BRIDGE_PORT = 5000
+MODELS = ["qwen3.5:9b", "qwen3.5:0.8b"]
+MAX_ROUNDS = 10
 
-def cleanup():
-    for p in ["ollama","ngrok","nebchat"]: os.system(f"pkill -9 -f {p} 2>/dev/null")
-    for port in [P_OL,P_BR]: os.system(f"fuser -k {port}/tcp 2>/dev/null")
+OLLAMA_URL = f"http://localhost:{OLLAMA_PORT}"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+OLLAMA_ENV = {
+    "OLLAMA_KEEP_ALIVE": "-1",
+    "OLLAMA_NUM_PARALLEL": "4",
+    "OLLAMA_MAX_LOADED_MODELS": "3",
+    "OLLAMA_GPU_LAYERS": "999",
+    "OLLAMA_FLASH_ATTENTION": "1",
+    "OLLAMA_KV_CACHE_TYPE": "q8_0",
+    "OLLAMA_CONTEXT_LENGTH": "8192",
+}
+
+
+# ─────────────────────────────────────────────
+# OLLAMA MANAGEMENT
+# ─────────────────────────────────────────────
+def cleanup_old_processes():
+    """Kill any leftover processes from previous runs."""
+    print("🧹 Cleaning up old processes...")
+    for proc in ["ollama", "ngrok", "nebchat"]:
+        os.system(f"pkill -9 -f {proc} 2>/dev/null")
+    for port in [OLLAMA_PORT, BRIDGE_PORT]:
+        os.system(f"fuser -k {port}/tcp 2>/dev/null")
     time.sleep(2)
 
+
 def start_ollama():
-    env=os.environ.copy(); env.update(OL_ENV); print("🚀 Ollama...")
-    subprocess.Popen(["ollama","serve"],stdout=subprocess.DEVNULL,stderr=open("/content/ollama.log","w"),env=env)
-    import requests as r
+    """Start Ollama server and wait for it to be ready."""
+    env = os.environ.copy()
+    env.update(OLLAMA_ENV)
+    print("🚀 Starting Ollama...")
+    subprocess.Popen(
+        ["ollama", "serve"],
+        stdout=subprocess.DEVNULL,
+        stderr=open("/content/ollama.log", "w"),
+        env=env,
+    )
     for _ in range(30):
-        try: r.get(f"http://127.0.0.1:{P_OL}/api/tags",timeout=2); print("✅ Ollama"); return
-        except: time.sleep(1)
-    raise RuntimeError("❌ Ollama failed")
+        try:
+            req_lib.get(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=2)
+            print("✅ Ollama is running!\n")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("❌ Ollama failed to start")
+
 
 def ensure_models():
-    import requests as r
-    try: ex=[m["name"] for m in r.get(f"http://127.0.0.1:{P_OL}/api/tags").json().get("models",[])]
-    except: ex=[]
-    for m in MODELS:
-        if not any(m in x for x in ex): print(f"⬇️ {m}..."); subprocess.run(["ollama","pull",m],check=True)
-        else: print(f"✅ {m}")
+    """Pull required models if not already present."""
+    print("📥 Checking models...")
+    try:
+        existing = [
+            m["name"]
+            for m in req_lib.get(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags").json().get("models", [])
+        ]
+    except Exception:
+        existing = []
 
-def warmup():
-    import requests as r; print("🔥 Warmup...")
-    for m in MODELS:
-        try: r.post(f"http://127.0.0.1:{P_OL}/api/generate",json={"model":m,"prompt":"hi","stream":False},timeout=240)
-        except: pass
-    print("✅ Warm!")
+    for model in MODELS:
+        if not any(model in x for x in existing):
+            print(f"  ⬇️ Pulling {model}...")
+            subprocess.run(["ollama", "pull", model], check=True)
+        else:
+            print(f"  ✅ {model} ready")
 
-# ── FLASK ──
-app=Flask(__name__); CORS(app,resources={r"/*":{"origins":"*"}})
-_rc=0; _rl=threading.Lock()
+
+def warmup_models():
+    """Pre-load models into GPU memory."""
+    print("🔥 Warming up models...")
+    for model in MODELS:
+        try:
+            req_lib.post(
+                f"http://127.0.0.1:{OLLAMA_PORT}/api/generate",
+                json={"model": model, "prompt": "hi", "stream": False},
+                timeout=240,
+            )
+        except Exception:
+            pass
+    print("✅ Models warmed up!\n")
+
+
+# ─────────────────────────────────────────────
+# FLASK APP
+# ─────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+_request_count = 0
+_request_lock = threading.Lock()
+
+
 @app.before_request
-def _log():
-    global _rc
-    with _rl: _rc+=1
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] #{_rc:05d} {request.method} {request.path}",flush=True)
+def log_request():
+    global _request_count
+    with _request_lock:
+        _request_count += 1
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{ts}] #{_request_count:05d} {request.method} {request.path}", flush=True)
 
-# ── PLAYWRIGHT — the ONLY engine ──
-_br=None; _bl=threading.Lock()
-def _get_br():
-    global _br
-    if _br: return _br
-    with _bl:
-        if _br: return _br
+
+# ─────────────────────────────────────────────
+# PLAYWRIGHT — the ONLY engine
+# ─────────────────────────────────────────────
+_browser = None
+_browser_lock = threading.Lock()
+
+
+def get_browser():
+    """Lazy-initialize a single shared Playwright browser instance."""
+    global _browser
+    if _browser is not None:
+        return _browser
+
+    with _browser_lock:
+        if _browser is not None:
+            return _browser
         try:
             from playwright.sync_api import sync_playwright
-            _br=sync_playwright().start().chromium.launch(headless=True,args=['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-extensions','--single-process'])
-            print("[PW] Browser up",flush=True)
-        except Exception as e: print(f"[PW] Fail:{e}",flush=True); _br=None
-    return _br
 
-def _search(query,n=10):
+            pw = sync_playwright().start()
+            _browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--single-process",
+                ],
+            )
+            print("[PW] Browser launched", flush=True)
+        except Exception as e:
+            print(f"[PW] Failed to launch browser: {e}", flush=True)
+            _browser = None
+
+    return _browser
+
+
+def search_web(query, max_results=10):
     """Search Bing via Playwright. One engine, zero fallbacks."""
-    b=_get_br()
-    if not b: return json.dumps({"error":"Browser not available"})
-    ctx=None
-    try:
-        ctx=b.new_context(user_agent=UA,viewport={'width':1280,'height':720},locale='en-US'); p=ctx.new_page()
-        p.goto(f'https://www.bing.com/search?q={urllib.parse.quote(query)}&count={n}&setlang=en&cc=US',timeout=15000,wait_until='domcontentloaded'); p.wait_for_timeout(2000)
-        if p.evaluate("()=>{const t=document.body.innerText||'';return t.includes('captcha')||t.includes('verify you are human')}"): ctx.close(); return json.dumps({"error":"Captcha detected"})
-        r=p.evaluate("(n)=>[...document.querySelectorAll('#b_results li.b_algo')].slice(0,n).map(li=>({title:li.querySelector('h2 a')?.textContent?.trim()||'',url:li.querySelector('h2 a')?.href||'',snippet:li.querySelector('.b_caption p,.b_lineclamp2,p')?.textContent?.trim()||''}))",n)
-        ctx.close(); ctx=None
-        if r:
-            for x in r: x['snippet']=(x.get('snippet','') or '')[:500]
-            print(f"[SEARCH] {len(r)} results for '{query[:40]}'",flush=True); return json.dumps(r)
-    except Exception as e: print(f"[SEARCH] Error: {e}",flush=True)
-    if ctx:
-        try: ctx.close()
-        except: pass
-    return json.dumps({"error":"Search failed"})
+    browser = get_browser()
+    if not browser:
+        return json.dumps({"error": "Browser not available"})
 
-def _read(url,mc=8000):
-    """Read any webpage via Playwright. Handles JS, stock tickers, dynamic content."""
-    b=_get_br()
-    if not b: return "Browser not available"
-    ctx=None
+    ctx = None
     try:
-        ctx=b.new_context(user_agent=UA,viewport={'width':1280,'height':720}); p=ctx.new_page()
-        p.goto(url,timeout=20000,wait_until='domcontentloaded'); p.wait_for_timeout(2000)
-        t=p.evaluate("(mc)=>{const s=['#mw-content-text','article','main','[role=\"main\"]','.post-content','.article-body','#content','.content'];let m;for(const sel of s){const e=document.querySelector(sel);if(e&&e.innerText.length>100){m=e;break}}if(!m)m=document.body;const c=m.cloneNode(true);c.querySelectorAll('script,style,nav,footer,header,aside,iframe,noscript,.ad,.cookie-banner,.popup,.modal,.sidebar').forEach(e=>e.remove());return(c.innerText||c.textContent||'').substring(0,mc)}",mc)
-        ctx.close(); ctx=None
-        if t and len(t.strip())>50: print(f"[READ] {len(t)} chars from {url[:60]}",flush=True); return t
-    except Exception as e: print(f"[READ] Error: {e}",flush=True)
+        ctx = browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 720},
+            locale="en-US",
+        )
+        page = ctx.new_page()
+        search_url = (
+            f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
+            f"&count={max_results}&setlang=en&cc=US"
+        )
+        page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+
+        # Check for captcha
+        is_captcha = page.evaluate(
+            "() => {"
+            "  const t = document.body.innerText || '';"
+            "  return t.includes('captcha') || t.includes('verify you are human');"
+            "}"
+        )
+        if is_captcha:
+            ctx.close()
+            return json.dumps({"error": "Captcha detected — try again later"})
+
+        # Extract results
+        results = page.evaluate(
+            "(n) => ["
+            "  ...document.querySelectorAll('#b_results li.b_algo')"
+            "].slice(0, n).map(li => ({"
+            "  title: li.querySelector('h2 a')?.textContent?.trim() || '',"
+            "  url: li.querySelector('h2 a')?.href || '',"
+            "  snippet: li.querySelector('.b_caption p, .b_lineclamp2, p')?.textContent?.trim() || ''"
+            "}))",
+            max_results,
+        )
+        ctx.close()
+        ctx = None
+
+        if results:
+            for r in results:
+                r["snippet"] = (r.get("snippet", "") or "")[:500]
+            print(f"[SEARCH] {len(results)} results for '{query[:40]}'", flush=True)
+            return json.dumps(results)
+
+    except Exception as e:
+        print(f"[SEARCH] Error: {e}", flush=True)
+
     if ctx:
-        try: ctx.close()
-        except: pass
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+    return json.dumps({"error": "Search failed"})
+
+
+def read_page(url, max_chars=8000):
+    """Read any webpage via Playwright. Handles JS-rendered content perfectly."""
+    browser = get_browser()
+    if not browser:
+        return "Browser not available"
+
+    ctx = None
+    try:
+        ctx = browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 720},
+        )
+        page = ctx.new_page()
+        page.goto(url, timeout=20000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+
+        # Extract main content (tries semantic selectors first, falls back to body)
+        text = page.evaluate(
+            "(mc) => {"
+            "  const selectors = ["
+            "    '#mw-content-text', 'article', 'main',"
+            "    '[role=\"main\"]', '.post-content', '.article-body',"
+            "    '#content', '.content'"
+            "  ];"
+            "  let main;"
+            "  for (const sel of selectors) {"
+            "    const el = document.querySelector(sel);"
+            "    if (el && el.innerText.length > 100) { main = el; break; }"
+            "  }"
+            "  if (!main) main = document.body;"
+            "  const clone = main.cloneNode(true);"
+            "  clone.querySelectorAll("
+            "    'script, style, nav, footer, header, aside, iframe, "
+            "noscript, .ad, .cookie-banner, .popup, .modal, .sidebar'"
+            "  ).forEach(e => e.remove());"
+            "  return (clone.innerText || clone.textContent || '').substring(0, mc);"
+            "}",
+            max_chars,
+        )
+        ctx.close()
+        ctx = None
+
+        if text and len(text.strip()) > 50:
+            print(f"[READ] {len(text)} chars from {url[:60]}", flush=True)
+            return text
+
+    except Exception as e:
+        print(f"[READ] Error: {e}", flush=True)
+
+    if ctx:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
     return "Failed to read page."
 
-def _exec(nm,args):
-    if nm=="web_search": return _search(args.get("query",""))
-    if nm=="read_page": return _read(args.get("url",""))
-    return json.dumps({"error":f"Unknown:{nm}"})
 
-# ── AGENTIC ──
-TOOLS=[{"type":"function","function":{"name":"web_search","description":"Search the web for current info via headless browser","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},{"type":"function","function":{"name":"read_page","description":"Read full page content from any URL. Handles JS-rendered pages perfectly.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}]
-SYSP="""You are an AI with web search and page reading tools powered by a headless browser. You can search and read any webpage.
+def execute_tool(name, args):
+    """Dispatch a tool call to the right function."""
+    if name == "web_search":
+        return search_web(args.get("query", ""))
+    if name == "read_page":
+        return read_page(args.get("url", ""))
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+
+# ─────────────────────────────────────────────
+# AGENTIC LOOP
+# ─────────────────────────────────────────────
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current info via headless browser",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_page",
+            "description": "Read full page content from any URL. Handles JS-rendered pages perfectly.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+]
+
+SYSTEM_PROMPT = """You are an AI with web search and page reading tools powered by a headless browser. You can search and read any webpage.
+
 RULES:
 1) For time-sensitive queries (prices, news, weather), MUST web_search FIRST
 2) After searching, use read_page on relevant URLs for detailed content
@@ -140,162 +400,440 @@ RULES:
 6) Cite sources with URLs
 7) Keep searching and reading until you have complete, accurate data"""
 
-def _ollama(body):
-    body["stream"]=False; r=urllib.request.Request(f"{OL}/v1/chat/completions",data=json.dumps(body).encode(),headers={"Content-Type":"application/json"},method="POST"); return json.loads(urllib.request.urlopen(r,timeout=300).read())
 
-def _sse(cid,ts,m,d): return f"data: {json.dumps({'id':cid,'object':'chat.completion.chunk','created':ts,'model':m,'choices':[{'index':0,'delta':d,'finish_reason':None}]})}\n\n"
+def call_ollama(body):
+    """Non-streaming call to Ollama."""
+    body["stream"] = False
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=300)
+    return json.loads(resp.read())
 
-def _agentic(body,stream):
-    msgs=list(body.get("messages",[])); model=body.get("model","qwen3:8b")
-    if not any(m.get("role")=="system" for m in msgs): msgs.insert(0,{"role":"system","content":SYSP})
+
+def make_sse_chunk(chat_id, created, model, delta):
+    """Build a single SSE chunk string."""
+    chunk = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def handle_agentic(body, stream):
+    """Run the agentic tool-calling loop."""
+    messages = list(body.get("messages", []))
+    model = body.get("model", "qwen3:8b")
+
+    # Inject system prompt
+    has_system = any(m.get("role") == "system" for m in messages)
+    if not has_system:
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
     else:
-        for m in msgs:
-            if m.get("role")=="system": m["content"]=SYSP+"\n\n"+m.get("content",""); break
-    body["tools"]=TOOLS; body["tool_choice"]="auto"
-    if not stream:
-        resp=None
-        for _ in range(MAXR):
-            body["messages"]=msgs
-            try: resp=_ollama(body)
-            except Exception as e: return jsonify({"error":str(e)}),502
-            msg=resp["choices"][0]["message"]
-            if not msg.get("tool_calls"): break
-            msgs.append(msg)
-            for tc in msg["tool_calls"]: msgs.append({"role":"tool","tool_call_id":tc.get("id",""),"content":_exec(tc["function"]["name"],json.loads(tc["function"].get("arguments","{}")))})
-        return jsonify(resp) if resp else (jsonify({"error":"No response"}),502)
-    def gen():
-        cid=f"chatcmpl-{int(time.time()*1000)}"; ts=int(time.time()); resp=None
-        for rnd in range(MAXR):
-            body["messages"]=msgs
-            try: resp=_ollama(body)
-            except Exception as e: yield _sse(cid,ts,model,{"content":f"\n\n⚠️ {e}"}); yield "data: [DONE]\n\n"; return
-            msg=resp["choices"][0]["message"]; tcs=msg.get("tool_calls",[])
-            if not tcs: break
-            msgs.append(msg)
-            for tc in tcs:
-                fn=tc["function"]; nm=fn["name"]; args=json.loads(fn.get("arguments","{}")); tid=tc.get("id","")
-                print(f"[AG] R{rnd+1}:{nm}({json.dumps(args)[:60]})",flush=True)
-                if nm=="web_search": yield _sse(cid,ts,model,{"content":"","agentic_activity":{"type":"search","query":args.get("query",""),"round":rnd+1}})
-                elif nm=="read_page": yield _sse(cid,ts,model,{"content":"","agentic_activity":{"type":"read","url":args.get("url",""),"round":rnd+1}})
-                res=_exec(nm,args)
-                if nm=="web_search":
-                    try: yield _sse(cid,ts,model,{"content":"","agentic_activity":{"type":"search_results","count":len(json.loads(res)) if isinstance(json.loads(res),list) else 0,"round":rnd+1}})
-                    except: pass
-                elif nm=="read_page": yield _sse(cid,ts,model,{"content":"","agentic_activity":{"type":"read_done","chars":len(res),"round":rnd+1}})
-                msgs.append({"role":"tool","tool_call_id":tid,"content":res})
-        content=resp["choices"][0]["message"].get("content","") if resp else ""; thinking=resp["choices"][0]["message"].get("reasoning_content","") if resp else ""
-        if thinking:
-            for i in range(0,len(thinking),12): yield _sse(cid,ts,model,{"reasoning_content":thinking[i:i+12]})
-        for i in range(0,len(content),8):
-            d={"content":content[i:i+8]}
-            if i==0: d["role"]="assistant"
-            yield _sse(cid,ts,model,d)
-        yield f"data: {json.dumps({'id':cid,'object':'chat.completion.chunk','created':ts,'model':model,'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n"; yield "data: [DONE]\n\n"
-    return Response(stream_with_context(gen()),content_type="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        for m in messages:
+            if m.get("role") == "system":
+                m["content"] = SYSTEM_PROMPT + "\n\n" + m.get("content", "")
+                break
 
-# ── STREAM PROXY ──
-def _proxy(url,method,hdrs,body):
-    rq=urllib.request.Request(url,data=body,headers=hdrs,method=method)
-    try: resp=urllib.request.urlopen(rq,timeout=300)
+    body["tools"] = TOOL_DEFINITIONS
+    body["tool_choice"] = "auto"
+
+    # ── Non-streaming ──
+    if not stream:
+        resp = None
+        for _ in range(MAX_ROUNDS):
+            body["messages"] = messages
+            try:
+                resp = call_ollama(body)
+            except Exception as e:
+                return jsonify({"error": str(e)}), 502
+
+            msg = resp["choices"][0]["message"]
+            if not msg.get("tool_calls"):
+                break
+
+            messages.append(msg)
+            for tc in msg["tool_calls"]:
+                tool_result = execute_tool(
+                    tc["function"]["name"],
+                    json.loads(tc["function"].get("arguments", "{}")),
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": tool_result,
+                })
+
+        if resp:
+            return jsonify(resp)
+        return jsonify({"error": "No response"}), 502
+
+    # ── Streaming ──
+    def generate():
+        chat_id = f"chatcmpl-{int(time.time() * 1000)}"
+        created = int(time.time())
+        resp = None
+
+        for round_num in range(MAX_ROUNDS):
+            body["messages"] = messages
+            try:
+                resp = call_ollama(body)
+            except Exception as e:
+                yield make_sse_chunk(chat_id, created, model, {"content": f"\n\n⚠️ {e}"})
+                yield "data: [DONE]\n\n"
+                return
+
+            msg = resp["choices"][0]["message"]
+            tool_calls = msg.get("tool_calls", [])
+
+            if not tool_calls:
+                break
+
+            messages.append(msg)
+
+            for tc in tool_calls:
+                fn = tc["function"]
+                tool_name = fn["name"]
+                tool_args = json.loads(fn.get("arguments", "{}"))
+                tool_id = tc.get("id", "")
+
+                print(f"[AG] R{round_num+1}: {tool_name}({json.dumps(tool_args)[:60]})", flush=True)
+
+                # Stream activity events to the client
+                if tool_name == "web_search":
+                    yield make_sse_chunk(chat_id, created, model, {
+                        "content": "",
+                        "agentic_activity": {
+                            "type": "search",
+                            "query": tool_args.get("query", ""),
+                            "round": round_num + 1,
+                        },
+                    })
+                elif tool_name == "read_page":
+                    yield make_sse_chunk(chat_id, created, model, {
+                        "content": "",
+                        "agentic_activity": {
+                            "type": "read",
+                            "url": tool_args.get("url", ""),
+                            "round": round_num + 1,
+                        },
+                    })
+
+                # Execute the tool
+                result = execute_tool(tool_name, tool_args)
+
+                # Stream result events
+                if tool_name == "web_search":
+                    try:
+                        parsed = json.loads(result)
+                        count = len(parsed) if isinstance(parsed, list) else 0
+                    except Exception:
+                        count = 0
+                    yield make_sse_chunk(chat_id, created, model, {
+                        "content": "",
+                        "agentic_activity": {
+                            "type": "search_results",
+                            "count": count,
+                            "round": round_num + 1,
+                        },
+                    })
+                elif tool_name == "read_page":
+                    yield make_sse_chunk(chat_id, created, model, {
+                        "content": "",
+                        "agentic_activity": {
+                            "type": "read_done",
+                            "chars": len(result),
+                            "round": round_num + 1,
+                        },
+                    })
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "content": result,
+                })
+
+        # Stream the final response
+        content = resp["choices"][0]["message"].get("content", "") if resp else ""
+        thinking = resp["choices"][0]["message"].get("reasoning_content", "") if resp else ""
+
+        if thinking:
+            for i in range(0, len(thinking), 12):
+                yield make_sse_chunk(chat_id, created, model, {"reasoning_content": thinking[i:i+12]})
+
+        for i in range(0, len(content), 8):
+            delta = {"content": content[i:i+8]}
+            if i == 0:
+                delta["role"] = "assistant"
+            yield make_sse_chunk(chat_id, created, model, delta)
+
+        # Final chunk with finish_reason
+        final = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ─────────────────────────────────────────────
+# STREAM PROXY (for non-agentic requests)
+# ─────────────────────────────────────────────
+def proxy_request(url, method, headers, body):
+    """Proxy a request to Ollama, handling both SSE and regular responses."""
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=300)
     except urllib.error.HTTPError as e:
-        err=""
-        try: err=e.read().decode("utf-8",errors="replace")
-        except: pass
-        return Response(err or e.reason,status=e.code,content_type="application/json")
-    except urllib.error.URLError as e: return jsonify({"error":f"Unreachable:{e.reason}"}),502
-    ct=resp.headers.get("Content-Type","application/octet-stream")
-    if "text/event-stream" in ct:
-        dq=queue.Queue(); done=threading.Event(); errs=[]
-        def rd():
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return Response(err_body or e.reason, status=e.code, content_type="application/json")
+    except urllib.error.URLError as e:
+        return jsonify({"error": f"Unreachable: {e.reason}"}), 502
+
+    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+
+    # SSE stream — read in background thread, yield from queue
+    if "text/event-stream" in content_type:
+        data_queue = queue.Queue()
+        done_event = threading.Event()
+        errors = []
+
+        def reader():
             try:
                 while True:
-                    c=resp.read(4096)
-                    if not c: break
-                    dq.put(c)
-            except Exception as e: errs.append(str(e))
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    data_queue.put(chunk)
+            except Exception as e:
+                errors.append(str(e))
             finally:
-                try: resp.close()
-                except: pass
-                done.set()
-        threading.Thread(target=rd,daemon=True).start()
-        def ka():
-            last=time.time()
-            while not done.is_set() or not dq.empty():
-                try: yield dq.get(timeout=1); last=time.time()
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                done_event.set()
+
+        threading.Thread(target=reader, daemon=True).start()
+
+        def keepalive_generator():
+            last = time.time()
+            while not done_event.is_set() or not data_queue.empty():
+                try:
+                    yield data_queue.get(timeout=1)
+                    last = time.time()
                 except queue.Empty:
-                    if time.time()-last>15: yield b": keepalive\n\n"; last=time.time()
-            if errs: yield f"data: {{'error':'{errs[0]}'}}\n\n".encode()
-        return Response(stream_with_context(ka()),content_type=ct,headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-    def gn():
+                    if time.time() - last > 15:
+                        yield b": keepalive\n\n"
+                        last = time.time()
+            if errors:
+                yield f"data: {{'error': '{errors[0]}'}}\n\n".encode()
+
+        return Response(
+            stream_with_context(keepalive_generator()),
+            content_type=content_type,
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # Regular response
+    def regular_generator():
         try:
             while True:
-                c=resp.read(4096)
-                if not c: break
-                yield c
-        except: pass
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        except Exception:
+            pass
         finally:
-            try: resp.close()
-            except: pass
-    return Response(stream_with_context(gn()),content_type=ct)
+            try:
+                resp.close()
+            except Exception:
+                pass
 
-# ── ROUTES ──
+    return Response(stream_with_context(regular_generator()), content_type=content_type)
+
+
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
 @app.route("/")
-def idx(): return jsonify({"name":"NebChat","v":"5.1","engine":"Playwright"})
-@app.route("/v1/models",methods=["GET"])
-def models():
-    try: return jsonify({"object":"list","data":[{"id":m["name"],"object":"model","owned_by":"ollama"} for m in req_lib.get(f"{OL}/api/tags",timeout=5).json().get("models",[])]})
-    except: return jsonify({"object":"list","data":[]})
-@app.route("/v1/chat/completions",methods=["POST"])
-def chat():
-    body=request.get_json(force=True); stream=body.get("stream",False); msgs=body.get("messages",[])
-    has_ag=any(m.get("role")=="system" and ("search" in m.get("content","").lower() or "agentic" in m.get("content","").lower()) for m in msgs)
-    auto_kw=["search","look up","find","current","latest","price","news","weather","stock","today","recent","score","who","when","where","how much","how many"]
-    if has_ag or any(kw in str(msgs[-1].get("content","")).lower() for kw in auto_kw): return _agentic(body,stream)
+def index():
+    return jsonify({"name": "NebChat", "v": "5.2", "engine": "Playwright"})
+
+
+@app.route("/v1/models", methods=["GET"])
+def list_models():
+    try:
+        models = req_lib.get(f"{OLLAMA_URL}/api/tags", timeout=5).json().get("models", [])
+        return jsonify({
+            "object": "list",
+            "data": [
+                {"id": m["name"], "object": "model", "owned_by": "ollama"}
+                for m in models
+            ],
+        })
+    except Exception:
+        return jsonify({"object": "list", "data": []})
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat_completions():
+    body = request.get_json(force=True)
+    stream = body.get("stream", False)
+    messages = body.get("messages", [])
+
+    # Detect agentic requests
+    has_agentic_prompt = any(
+        m.get("role") == "system" and (
+            "search" in m.get("content", "").lower()
+            or "agentic" in m.get("content", "").lower()
+        )
+        for m in messages
+    )
+
+    auto_trigger_keywords = [
+        "search", "look up", "find", "current", "latest",
+        "price", "news", "weather", "stock", "today",
+        "recent", "score", "who", "when", "where",
+        "how much", "how many",
+    ]
+    last_msg = str(messages[-1].get("content", "")).lower() if messages else ""
+    auto_agentic = any(kw in last_msg for kw in auto_trigger_keywords)
+
+    if has_agentic_prompt or auto_agentic:
+        return handle_agentic(body, stream)
+
+    # Non-agentic: just proxy to Ollama
     if stream:
-        qs=request.query_string.decode("utf-8"); return _proxy(f"{OL}/v1/chat/completions"+(f"?{qs}" if qs else ""),"POST",{k:v for k,v in request.headers if k.lower()!="host"},request.get_data())
-    try: return jsonify(_ollama(body))
-    except Exception as e: return jsonify({"error":str(e)}),502
-@app.route("/v1/<path:path>",methods=["GET","POST","PUT","DELETE","PATCH"])
-def pv1(path):
-    qs=request.query_string.decode("utf-8"); h={k:v for k,v in request.headers if k.lower()!="host"}; h["Content-Type"]="application/json"
-    return _proxy(f"{OL}/v1/{path}"+(f"?{qs}" if qs else ""),request.method,h,request.get_data())
-@app.route("/api/<path:path>",methods=["GET","POST","PUT","DELETE","PATCH"])
-def papi(path):
-    qs=request.query_string.decode("utf-8"); h={k:v for k,v in request.headers if k.lower()!="host"}; h["Content-Type"]="application/json"
-    return _proxy(f"{OL}/api/{path}"+(f"?{qs}" if qs else ""),request.method,h,request.get_data())
-@app.route("/search",methods=["GET"])
-def search():
-    q=request.args.get("q","")
-    return jsonify({"query":q,"results":json.loads(_search(q))}) if q else (jsonify({"error":"Missing ?q="}),400)
-@app.route("/crawl",methods=["POST"])
-def crawl():
-    url=request.get_json(force=True).get("url","")
-    return jsonify({"url":url,"content":_read(url)}) if url else (jsonify({"error":"Missing url"}),400)
-@app.route("/health",methods=["GET"])
+        qs = request.query_string.decode("utf-8")
+        target = f"{OLLAMA_URL}/v1/chat/completions" + (f"?{qs}" if qs else "")
+        headers = {k: v for k, v in request.headers if k.lower() != "host"}
+        return proxy_request(target, "POST", headers, request.get_data())
+
+    try:
+        return jsonify(call_ollama(body))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def proxy_v1(path):
+    qs = request.query_string.decode("utf-8")
+    headers = {k: v for k, v in request.headers if k.lower() != "host"}
+    headers["Content-Type"] = "application/json"
+    target = f"{OLLAMA_URL}/v1/{path}" + (f"?{qs}" if qs else "")
+    return proxy_request(target, request.method, headers, request.get_data())
+
+
+@app.route("/api/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def proxy_api(path):
+    qs = request.query_string.decode("utf-8")
+    headers = {k: v for k, v in request.headers if k.lower() != "host"}
+    headers["Content-Type"] = "application/json"
+    target = f"{OLLAMA_URL}/api/{path}" + (f"?{qs}" if qs else "")
+    return proxy_request(target, request.method, headers, request.get_data())
+
+
+@app.route("/search", methods=["GET"])
+def search_endpoint():
+    q = request.args.get("q", "")
+    if not q:
+        return jsonify({"error": "Missing ?q="}), 400
+    return jsonify({"query": q, "results": json.loads(search_web(q))})
+
+
+@app.route("/crawl", methods=["POST"])
+def crawl_endpoint():
+    url = request.get_json(force=True).get("url", "")
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+    return jsonify({"url": url, "content": read_page(url)})
+
+
+@app.route("/health", methods=["GET"])
 def health():
-    ol=pw=False
-    try: ol=req_lib.get(f"{OL}/api/tags",timeout=3).ok
-    except: pass
-    pw=_get_br() is not None
-    return jsonify({"status":"ok" if ol else "degraded","ollama":ol,"playwright":pw})
+    ollama_ok = False
+    try:
+        ollama_ok = req_lib.get(f"{OLLAMA_URL}/api/tags", timeout=3).ok
+    except Exception:
+        pass
+    playwright_ok = get_browser() is not None
+    return jsonify({
+        "status": "ok" if ollama_ok else "degraded",
+        "ollama": ollama_ok,
+        "playwright": playwright_ok,
+    })
+
+
 @app.errorhandler(404)
 @app.errorhandler(500)
-def _err(e): return jsonify({"error":str(e)}),getattr(e,'code',500)
+def handle_error(e):
+    return jsonify({"error": str(e)}), getattr(e, "code", 500)
 
-# ── MAIN ──
-def run():
-    from pyngrok import ngrok; ngrok.set_auth_token(NGROK_TOKEN); url=ngrok.connect(P_BR,bind_tls=True).public_url
-    print(f"\n{'='*60}\n🚀 NebChat LIVE!\n📡 {url}\n{'='*60}\n")
-    with open("/content/nebchat_url.txt","w") as f: f.write(url)
-    app.run(host="0.0.0.0",port=P_BR,threaded=True)
 
-def monitor(iv=120):
-    import requests as r
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+def start_bridge():
+    """Start ngrok tunnel and Flask server."""
+    from pyngrok import ngrok
+
+    ngrok.set_auth_token(NGROK_TOKEN)
+    public_url = ngrok.connect(BRIDGE_PORT, bind_tls=True).public_url
+
+    print(f"\n{'=' * 60}")
+    print(f"🚀 NebChat is LIVE!")
+    print(f"📡 {public_url}")
+    print(f"{'=' * 60}\n")
+
+    with open("/content/nebchat_url.txt", "w") as f:
+        f.write(public_url)
+
+    app.run(host="0.0.0.0", port=BRIDGE_PORT, threaded=True)
+
+
+def monitor(interval=120):
+    """Periodic health check."""
     while True:
-        time.sleep(iv)
-        try: print(f"[MON] {r.get(f'http://127.0.0.1:{P_BR}/health',timeout=5).json()}",flush=True)
-        except: print("[MON] Down!",flush=True)
+        time.sleep(interval)
+        try:
+            status = req_lib.get(f"http://127.0.0.1:{BRIDGE_PORT}/health", timeout=5).json()
+            print(f"[MON] {status}", flush=True)
+        except Exception:
+            print("[MON] Server down!", flush=True)
 
-if __name__=="__main__":
-    setup(); cleanup(); start_ollama(); ensure_models(); warmup()
-    threading.Thread(target=monitor,daemon=True).start(); run()
+
+if __name__ == "__main__":
+    # Step 1: Install dependencies (BEFORE any other imports happen)
+    install_deps()
+
+    # Step 2: Clean up, start services
+    cleanup_old_processes()
+    start_ollama()
+    ensure_models()
+    warmup_models()
+
+    # Step 3: Start monitoring + bridge
+    threading.Thread(target=monitor, daemon=True).start()
+    start_bridge()
