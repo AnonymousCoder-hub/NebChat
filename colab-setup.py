@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NebChat v5.2 — Ollama + Playwright + Flask Bridge + ngrok
-Playwright ONLY for search & content. No fallbacks, no bloat.
+NebChat v5.3 — Ollama + Playwright + Flask Bridge + ngrok
+Playwright ONLY for search & content. Thread-safe async design.
 Paste this ENTIRE script in a single Colab cell and run.
 """
 
@@ -69,10 +69,12 @@ install_deps()
 # (these run AFTER install_deps() completes)
 # ─────────────────────────────────────────────
 import json
+import asyncio
 import time
 import shutil
 import queue
 import threading
+import concurrent.futures
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -198,78 +200,105 @@ def log_request():
 
 
 # ─────────────────────────────────────────────
-# PLAYWRIGHT — the ONLY engine
+# PLAYWRIGHT — the ONLY engine (THREAD-SAFE)
 # ─────────────────────────────────────────────
-_browser = None
-_browser_lock = threading.Lock()
+# Playwright's sync API creates an event loop in the thread where
+# sync_playwright().start() is called. Flask uses multiple threads
+# for requests, so calling sync_playwright from Flask threads causes
+# "cannot switch to a different thread" errors.
+#
+# FIX: Use async_playwright in a dedicated thread with its own
+# asyncio event loop. Flask threads submit coroutines via
+# asyncio.run_coroutine_threadsafe() and wait for results.
+
+_pw_loop = None          # asyncio event loop running in PW thread
+_pw_browser = None       # single shared browser instance
+_pw_ready = threading.Event()
 
 
-def get_browser():
-    """Lazy-initialize a single shared Playwright browser instance."""
-    global _browser
-    if _browser is not None:
-        return _browser
+def _pw_thread_main():
+    """Dedicated thread: runs the asyncio event loop that owns Playwright."""
+    global _pw_loop, _pw_browser
 
-    with _browser_lock:
-        if _browser is not None:
-            return _browser
-        try:
-            from playwright.sync_api import sync_playwright
+    async def _start_and_keep_alive():
+        global _pw_browser
+        from playwright.async_api import async_playwright
 
-            pw = sync_playwright().start()
-            _browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                    "--single-process",
-                ],
-            )
-            print("[PW] Browser launched", flush=True)
-        except Exception as e:
-            print(f"[PW] Failed to launch browser: {e}", flush=True)
-            _browser = None
+        pw = await async_playwright().start()
+        _pw_browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--single-process",
+            ],
+        )
+        print("[PW] Browser launched (async, dedicated thread)", flush=True)
+        _pw_ready.set()
 
-    return _browser
+        # Keep the loop alive forever so the browser stays open
+        while True:
+            await asyncio.sleep(3600)
+
+    _pw_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_pw_loop)
+
+    try:
+        _pw_loop.run_until_complete(_start_and_keep_alive())
+    except Exception as e:
+        print(f"[PW] Fatal: {e}", flush=True)
+        _pw_ready.set()  # unblock even on failure
 
 
-def search_web(query, max_results=10):
-    """Search Bing via Playwright. One engine, zero fallbacks."""
-    browser = get_browser()
-    if not browser:
-        return json.dumps({"error": "Browser not available"})
+# Start the Playwright thread at module level
+_pw_thread = threading.Thread(target=_pw_thread_main, daemon=True)
+_pw_thread.start()
+_pw_ready.wait(timeout=60)  # block until browser is ready (or timeout)
 
+
+def _pw_submit(coro):
+    """Submit an async coroutine to the Playwright event loop, wait for result."""
+    if _pw_loop is None or _pw_browser is None:
+        raise RuntimeError("Playwright not initialized")
+    future = asyncio.run_coroutine_threadsafe(coro, _pw_loop)
+    return future.result(timeout=120)
+
+
+# ── Async Playwright operations (run on PW thread) ──
+
+async def _async_search(query, max_results=10):
+    """Search Bing via Playwright (async, runs on PW thread)."""
     ctx = None
     try:
-        ctx = browser.new_context(
+        ctx = await _pw_browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 720},
             locale="en-US",
         )
-        page = ctx.new_page()
+        page = await ctx.new_page()
         search_url = (
             f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
             f"&count={max_results}&setlang=en&cc=US"
         )
-        page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+        await page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
 
         # Check for captcha
-        is_captcha = page.evaluate(
+        is_captcha = await page.evaluate(
             "() => {"
             "  const t = document.body.innerText || '';"
             "  return t.includes('captcha') || t.includes('verify you are human');"
             "}"
         )
         if is_captcha:
-            ctx.close()
+            await ctx.close()
             return json.dumps({"error": "Captcha detected — try again later"})
 
         # Extract results
-        results = page.evaluate(
+        results = await page.evaluate(
             "(n) => ["
             "  ...document.querySelectorAll('#b_results li.b_algo')"
             "].slice(0, n).map(li => ({"
@@ -279,7 +308,7 @@ def search_web(query, max_results=10):
             "}))",
             max_results,
         )
-        ctx.close()
+        await ctx.close()
         ctx = None
 
         if results:
@@ -293,31 +322,26 @@ def search_web(query, max_results=10):
 
     if ctx:
         try:
-            ctx.close()
+            await ctx.close()
         except Exception:
             pass
 
     return json.dumps({"error": "Search failed"})
 
 
-def read_page(url, max_chars=8000):
-    """Read any webpage via Playwright. Handles JS-rendered content perfectly."""
-    browser = get_browser()
-    if not browser:
-        return "Browser not available"
-
+async def _async_read_page(url, max_chars=8000):
+    """Read any webpage via Playwright (async, runs on PW thread)."""
     ctx = None
     try:
-        ctx = browser.new_context(
+        ctx = await _pw_browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 720},
         )
-        page = ctx.new_page()
-        page.goto(url, timeout=20000, wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+        page = await ctx.new_page()
+        await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
 
-        # Extract main content (tries semantic selectors first, falls back to body)
-        text = page.evaluate(
+        text = await page.evaluate(
             "(mc) => {"
             "  const selectors = ["
             "    '#mw-content-text', 'article', 'main',"
@@ -339,7 +363,7 @@ def read_page(url, max_chars=8000):
             "}",
             max_chars,
         )
-        ctx.close()
+        await ctx.close()
         ctx = None
 
         if text and len(text.strip()) > 50:
@@ -351,11 +375,36 @@ def read_page(url, max_chars=8000):
 
     if ctx:
         try:
-            ctx.close()
+            await ctx.close()
         except Exception:
             pass
 
     return "Failed to read page."
+
+
+# ── Public sync wrappers (called from Flask threads) ──
+
+def search_web(query, max_results=10):
+    """Search Bing via Playwright. Thread-safe wrapper."""
+    try:
+        return _pw_submit(_async_search(query, max_results))
+    except Exception as e:
+        print(f"[SEARCH] Submit error: {e}", flush=True)
+        return json.dumps({"error": f"Search error: {e}"})
+
+
+def read_page(url, max_chars=8000):
+    """Read any webpage via Playwright. Thread-safe wrapper."""
+    try:
+        return _pw_submit(_async_read_page(url, max_chars))
+    except Exception as e:
+        print(f"[READ] Submit error: {e}", flush=True)
+        return f"Read error: {e}"
+
+
+def get_browser_status():
+    """Check if Playwright browser is alive (for /health endpoint)."""
+    return _pw_browser is not None
 
 
 def execute_tool(name, args):
@@ -687,7 +736,7 @@ def proxy_request(url, method, headers, body):
 # ─────────────────────────────────────────────
 @app.route("/")
 def index():
-    return jsonify({"name": "NebChat", "v": "5.2", "engine": "Playwright"})
+    return jsonify({"name": "NebChat", "v": "5.3", "engine": "Playwright"})
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -786,7 +835,7 @@ def health():
         ollama_ok = req_lib.get(f"{OLLAMA_URL}/api/tags", timeout=3).ok
     except Exception:
         pass
-    playwright_ok = get_browser() is not None
+    playwright_ok = get_browser_status()
     return jsonify({
         "status": "ok" if ollama_ok else "degraded",
         "ollama": ollama_ok,
@@ -839,6 +888,6 @@ if __name__ == "__main__":
     ensure_models()
     warmup_models()
 
-    # Step 3: Start monitoring + bridge
+    # Start monitoring + bridge
     threading.Thread(target=monitor, daemon=True).start()
     start_bridge()
