@@ -1007,6 +1007,8 @@ export function ResearchView() {
     createSwarmConversation,
     addMessage,
     updateSwarmOutput,
+    swarmConfigOpen,
+    setSwarmConfigOpen,
   } = useAppStore();
   const updateSwarmSteps = useAppStore((s) => s.updateSwarmSteps);
   const enabledProviders = providers.filter(
@@ -1040,7 +1042,6 @@ export function ResearchView() {
   const [pendingIntervention, setPendingIntervention] = useState<string | null>(
     null
   );
-  const [showConfig, setShowConfig] = useState(true);
   const [liveStreamText, setLiveStreamText] = useState("");
   const [isWaitingForUser, setIsWaitingForUser] = useState(false);
   const [todoList, setTodoList] = useState<TodoItem[]>([]);
@@ -2115,20 +2116,19 @@ export function ResearchView() {
             </div>
           </div>
           <div className="flex items-center gap-1.5">
-            {hasStarted && (
-              <Button
-                variant={showConfig ? "secondary" : "ghost"}
-                size="sm"
-                className="h-6 gap-1 text-[10px] px-2"
-                onClick={() => setShowConfig(!showConfig)}
-              >
-                {showConfig ? (
-                  <PanelLeftClose className="h-3 w-3" />
-                ) : (
-                  <PanelLeft className="h-3 w-3" />
-                )}
-              </Button>
-            )}
+            <Button
+              variant={swarmConfigOpen ? "secondary" : "ghost"}
+              size="sm"
+              className="h-6 gap-1 text-[10px] px-2"
+              onClick={() => setSwarmConfigOpen(!swarmConfigOpen)}
+              title={swarmConfigOpen ? "Hide config panel" : "Show config panel"}
+            >
+              {swarmConfigOpen ? (
+                <PanelLeftClose className="h-3 w-3" />
+              ) : (
+                <PanelLeft className="h-3 w-3" />
+              )}
+            </Button>
             {isRunning && (
               <Badge
                 variant="outline"
@@ -2159,12 +2159,12 @@ export function ResearchView() {
 
       <div className="flex-1 flex min-h-0 relative">
         {/* Left Panel: Config */}
-        {showConfig && (
+        {swarmConfigOpen && (
           <>
             {/* Mobile backdrop */}
             <div
               className="fixed inset-0 bg-black/40 z-10 md:hidden"
-              onClick={() => setShowConfig(false)}
+              onClick={() => setSwarmConfigOpen(false)}
             />
             <div className="w-[85vw] md:w-72 shrink-0 border-r flex flex-col min-h-0 fixed md:relative z-20 md:z-10 bg-background h-full shadow-lg md:shadow-none top-0 md:top-auto left-0">
               <div

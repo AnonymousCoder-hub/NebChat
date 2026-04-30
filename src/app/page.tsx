@@ -7,7 +7,6 @@ import { HomeView } from "@/components/home/HomeView";
 import { ChatView } from "@/components/chat/ChatView";
 import { ResearchView } from "@/components/research/ResearchView";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
-import { SwarmConfigSheet } from "@/components/shared/SwarmConfigSheet";
 import { Button } from "@/components/ui/button";
 import { PanelLeft, Zap } from "lucide-react";
 
@@ -84,9 +83,6 @@ export default function Page() {
 
       {/* Settings dialog */}
       <SettingsDialog open={settingsOpen} onOpenChange={(open) => useAppStore.getState().setSettingsOpen(open)} />
-
-      {/* Swarm Config Sheet */}
-      <SwarmConfigSheet />
     </div>
   );
 }
