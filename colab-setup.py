@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================
-#  NebChat Colab Setup — v2.0
-#  Ollama + Jina Search + DuckDuckGo + Crawl4AI + Flask Bridge + ngrok
+#  NebChat Colab Setup — v3.0
+#  Ollama + Agentic Search + Crawl4AI + Flask Bridge + ngrok
+#  Features: AI-powered web search, page reading, reasoning_effort
 #  Run this ENTIRE script in a single Colab cell.
 # ============================================================
 
@@ -177,84 +178,17 @@ def warmup_all():
             pass
     print("✅ Warmed up successfully!")
 
-# -------------------- SEARCH FUNCTIONS --------------------
-def jina_search(query, max_results=10):
-    import requests
-    try:
-        resp = requests.get(
-            f"https://s.jina.ai/{query}",
-            headers={"Accept": "application/json"},
-            params={"num": max_results},
-            timeout=15
-        )
-        if not resp.ok:
-            return None
-        data = resp.json()
-        results = []
-        for item in data.get("data", []):
-            results.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "content": item.get("content", "")[:3000],
-                "description": item.get("description", ""),
-            })
-        return results
-    except Exception as e:
-        print(f"⚠️ Jina search error: {e}")
-        return None
-
-def duckduckgo_search(query, max_results=10):
-    try:
-        from duckduckgo_search import DDGS
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "content": r.get("body", ""),
-                })
-            if len(results) < max_results:
-                try:
-                    for r in ddgs.news(query, max_results=min(5, max_results - len(results))):
-                        results.append({
-                            "title": r.get("title", ""),
-                            "url": r.get("url", r.get("href", "")),
-                            "content": r.get("body", ""),
-                        })
-                except:
-                    pass
-        return results
-    except Exception as e:
-        print(f"⚠️ DuckDuckGo search error: {e}")
-        return None
-
-def jina_read_page(url):
-    import requests
-    try:
-        resp = requests.get(
-            f"https://r.jina.ai/{url}",
-            headers={"Accept": "text/plain"},
-            timeout=15
-        )
-        if resp.ok:
-            return resp.text[:5000]
-        return None
-    except:
-        return None
-
-# -------------------- FLASK BRIDGE (written to file) --------------------
+# -------------------- BRIDGE (written to file) --------------------
 def write_bridge_file():
-    # Write the Flask bridge as a separate Python file to avoid
-    # triple-quote escaping issues in Colab cells
     bridge_path = "/content/nebchat_bridge.py"
     with open(bridge_path, "w") as f:
         f.write(BRIDGE_CODE)
     print(f"📝 Bridge script written to {bridge_path}")
     return bridge_path
 
-BRIDGE_CODE = """#!/usr/bin/env python3
-# NebChat Unified Bridge — Flask application
+BRIDGE_CODE = r'''#!/usr/bin/env python3
+# NebChat Agentic Bridge v3.0 — Flask application
+# Supports: Ollama proxy, Agentic search/crawl, SSE keepalive
 
 import os, sys, time, json, traceback, threading, queue
 import urllib.request, urllib.error, urllib.parse
@@ -269,6 +203,7 @@ CRAWL4AI_BASE = f"http://localhost:{PORT_CRAWL4AI}"
 JINA_SEARCH_URL = "https://s.jina.ai/"
 JINA_READER_URL = "https://r.jina.ai/"
 KEEPALIVE_INTERVAL = 15
+AGENTIC_MAX_ROUNDS = 5
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -288,6 +223,110 @@ def _log_req():
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] #{rid:05d} {request.method} {request.path}", flush=True)
 
+# ==================== TOOL DEFINITIONS ====================
+AGENTIC_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for up-to-date information. Returns titles, URLs, and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_page",
+            "description": "Read the full content of a web page as markdown. Use for detailed info from URLs found via search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to read"}
+                },
+                "required": ["url"]
+            }
+        }
+    }
+]
+
+# ==================== TOOL EXECUTION ====================
+def _tool_web_search(query):
+    """Jina Search -> DuckDuckGo fallback"""
+    try:
+        url = f"{JINA_SEARCH_URL}{urllib.parse.quote(query)}"
+        headers = {"Accept": "application/json", "X-No-Cache": "true"}
+        jina_key = os.environ.get("JINA_API_KEY", "")
+        if jina_key:
+            headers["Authorization"] = f"Bearer {jina_key}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        results = []
+        for item in data.get("data", [])[:8]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": (item.get("description") or item.get("content", ""))[:500],
+            })
+        if results:
+            return json.dumps(results)
+    except Exception as e:
+        print(f"[AGENTIC] Jina error: {e}", flush=True)
+    # DDG fallback
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            ddg_results = list(ddgs.text(query, max_results=8))
+        results = []
+        for r in ddg_results:
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", "")[:500],
+            })
+        return json.dumps(results)
+    except Exception as e:
+        print(f"[AGENTIC] DDG error: {e}", flush=True)
+        return json.dumps({"error": "Search failed"})
+
+def _tool_read_page(url):
+    """Crawl4AI -> Jina Reader fallback"""
+    try:
+        import requests as req_lib
+        resp = req_lib.post(f"{CRAWL4AI_BASE}/crawl", json={"url": url}, timeout=30)
+        if resp.ok:
+            data = resp.json()
+            content = data.get("content", {}).get("markdown", "")
+            if content and len(content.strip()) > 50:
+                return content[:4000]
+    except:
+        pass
+    try:
+        jina_url = f"{JINA_READER_URL}{urllib.parse.quote(url, safe=':/?#[]@!$&()*+,;=')}"
+        headers = {"Accept": "text/markdown"}
+        jina_key = os.environ.get("JINA_API_KEY", "")
+        if jina_key:
+            headers["Authorization"] = f"Bearer {jina_key}"
+        req = urllib.request.Request(jina_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")[:4000]
+    except:
+        return "Failed to read page content."
+
+def _execute_tool(name, args):
+    if name == "web_search":
+        return _tool_web_search(args.get("query", ""))
+    elif name == "read_page":
+        return _tool_read_page(args.get("url", ""))
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+# ==================== STREAMING HELPERS ====================
 def _proxy_url(base, path):
     qs = request.query_string.decode("utf-8")
     url = f"{base}/{path}"
@@ -344,10 +383,10 @@ def _stream_response(upstream_url, method, headers, body):
                     last_ka = time.time()
                 except queue.Empty:
                     if time.time() - last_ka > KEEPALIVE_INTERVAL:
-                        yield b": keepalive\\n\\n"
+                        yield b": keepalive\n\n"
                         last_ka = time.time()
             if errors:
-                yield f"data: {{'error': '{errors[0]}'}}\\n\\n".encode()
+                yield f"data: {{'error': '{errors[0]}'}}\n\n".encode()
 
         return Response(
             stream_with_context(sse_keepalive()),
@@ -372,15 +411,127 @@ def _stream_response(upstream_url, method, headers, body):
 
     return Response(stream_with_context(generate()), content_type=content_type)
 
+def _simulated_stream(content, thinking, model):
+    """Simulate SSE streaming for agentic responses — sends in chunks for smooth display."""
+    def generate():
+        chunk_id = f"chatcmpl-{int(time.time()*1000)}"
+        ts = int(time.time())
+
+        # Send thinking content first (if any)
+        if thinking:
+            for i in range(0, len(thinking), 30):
+                data = {
+                    "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": thinking[i:i+30]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+
+        # Send content in chunks
+        for i in range(0, len(content), 20):
+            delta = {}
+            if i == 0:
+                delta["role"] = "assistant"
+            delta["content"] = content[i:i+20]
+            data = {
+                "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+
+        # Done
+        data = {
+            "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(data)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+# ==================== AGENTIC CHAT HANDLER ====================
+def _ollama_call(body_json):
+    """Make a non-streaming call to Ollama and return the parsed response."""
+    body_json["stream"] = False
+    req_body = json.dumps(body_json).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/v1/chat/completions",
+        data=req_body,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return json.loads(resp.read())
+
+def _handle_agentic(body_json, should_stream):
+    """Agentic loop: AI decides when to search/read, executes tools, returns final answer."""
+    messages = list(body_json.get("messages", []))
+    model = body_json.get("model", "qwen3:8b")
+
+    # Inject tools
+    body_json["tools"] = AGENTIC_TOOLS
+    body_json["tool_choice"] = "auto"
+
+    response_data = None
+
+    for round_num in range(AGENTIC_MAX_ROUNDS):
+        body_json["messages"] = messages
+        try:
+            response_data = _ollama_call(body_json)
+        except Exception as e:
+            return jsonify({"error": f"Ollama error: {e}"}), 502
+
+        choice = response_data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        tool_calls = message.get("tool_calls", [])
+
+        if not tool_calls:
+            break  # Final response — no more tool calls
+
+        # Process tool calls
+        messages.append(message)
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            args = json.loads(func.get("arguments", "{}"))
+            tc_id = tc.get("id", "")
+
+            print(f"[AGENTIC] Round {round_num+1}: {name}({json.dumps(args)[:100]})", flush=True)
+            result = _execute_tool(name, args)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": result,
+            })
+
+    # Get final content
+    if response_data is None:
+        return jsonify({"error": "No response from Ollama"}), 502
+
+    final_message = response_data.get("choices", [{}])[0].get("message", {})
+    final_content = final_message.get("content", "")
+    final_thinking = final_message.get("reasoning_content", final_message.get("thinking", ""))
+
+    if should_stream:
+        return _simulated_stream(final_content, final_thinking, model)
+    else:
+        return jsonify(response_data)
+
+# ==================== ROUTES ====================
 @app.route("/")
 def index():
     return jsonify({
-        "service": "NebChat Unified Bridge",
-        "version": "2.0",
+        "service": "NebChat Agentic Bridge",
+        "version": "3.0",
+        "agentic": True,
         "endpoints": {
             "GET /": "Status page",
             "GET /v1/models": "List Ollama models",
-            "POST /v1/chat/completions": "OpenAI-compatible chat (streaming)",
+            "POST /v1/chat/completions": "Chat (supports agentic mode with tools)",
             "* /v1/<path>": "Proxy to Ollama /v1/*",
             "* /api/<path>": "Proxy to Ollama /api/*",
             "GET /search?q=...": "Search (Jina + DDG fallback)",
@@ -402,11 +553,19 @@ def list_models():
 
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
-    body = request.get_data()
+    body_raw = request.get_data()
+    body_json = json.loads(body_raw) if body_raw else {}
+    is_agentic = body_json.get("agentic", False)
+
+    if is_agentic:
+        should_stream = body_json.get("stream", True)
+        return _handle_agentic(body_json, should_stream)
+
+    # Normal proxy
     headers = {"Content-Type": request.content_type or "application/json"}
     return _stream_response(
         _proxy_url(OLLAMA_BASE, "v1/chat/completions"),
-        method="POST", headers=headers, body=body,
+        method="POST", headers=headers, body=body_raw,
     )
 
 @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -438,7 +597,7 @@ def search():
     if not query:
         return jsonify({"error": "Missing query parameter 'q'"}), 400
 
-    # --- Jina AI Search ---
+    # Jina AI Search
     try:
         jina_url = f"{JINA_SEARCH_URL}{urllib.parse.quote(query)}"
         jina_headers = {"Accept": "application/json", "X-Return-Format": "search", "X-No-Cache": "true"}
@@ -462,7 +621,7 @@ def search():
     except Exception as exc:
         print(f"[SEARCH] Jina failed: {exc}", flush=True)
 
-    # --- DuckDuckGo fallback ---
+    # DuckDuckGo fallback
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
@@ -489,7 +648,7 @@ def crawl():
     if not url:
         return jsonify({"error": "Missing 'url' in request body"}), 400
 
-    # --- Crawl4AI ---
+    # Crawl4AI
     try:
         import requests as req_lib
         resp = req_lib.post(f"{CRAWL4AI_BASE}/crawl", json={"url": url}, timeout=60)
@@ -507,7 +666,7 @@ def crawl():
     except Exception as exc:
         print(f"[CRAWL] Crawl4AI failed: {exc}", flush=True)
 
-    # --- Jina Reader fallback ---
+    # Jina Reader fallback
     try:
         jina_url = f"{JINA_READER_URL}{urllib.parse.quote(url, safe=':/?#[]@!$&()*+,;=')}"
         jina_headers = {"Accept": "text/markdown"}
@@ -548,6 +707,7 @@ def health():
     except:
         services["crawl4ai"] = {"status": "offline"}
     services["jina_search"] = {"status": "available"}
+    services["agentic"] = {"status": "enabled"}
     return jsonify({"status": "ok", "services": services})
 
 @app.errorhandler(404)
@@ -560,12 +720,13 @@ def server_error(e):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  NebChat Unified Bridge")
+    print("  NebChat Agentic Bridge v3.0")
     print(f"  Ollama:   {OLLAMA_BASE}")
     print(f"  Crawl4AI: {CRAWL4AI_BASE}")
+    print(f"  Agentic:  Enabled (max {AGENTIC_MAX_ROUNDS} rounds)")
     print("=" * 60)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT_BRIDGE", 5000)), debug=False, threaded=True)
-"""
+'''
 
 # -------------------- START BRIDGE + TUNNEL --------------------
 def start_bridge_and_tunnel():
@@ -601,7 +762,7 @@ def start_bridge_and_tunnel():
         print(f"\n📊 Services status:")
         for svc, status in health.get("services", {}).items():
             s = status.get("status", "unknown") if isinstance(status, dict) else status
-            icon = "✅" if s in ("ok", "available") else "⚠️" if s == "offline" else "❌"
+            icon = "✅" if s in ("ok", "available", "enabled") else "⚠️" if s == "offline" else "❌"
             print(f"   {icon} {svc}: {s}")
     except:
         print("⚠️ Bridge health check failed, but it may still be starting...")
@@ -623,14 +784,15 @@ def start_bridge_and_tunnel():
     print("🐝 NebChat Stack is READY!")
     print("=" * 60)
     print(f"\n🌐 BASE URL (use for everything): {BASE}")
-    print(f"\n📝 In NebChat Settings, paste this URL in:")
-    print(f"   1. Add Provider  → Base URL: {BASE}")
-    print(f"   2. Add Provider  → API Key:  ollama")
-    print(f"   3. Add Search    → Type: DuckDuckGo  → URL: {BASE}")
+    print(f"\n📝 In NebChat Settings:")
+    print(f"   1. Add Provider → Base URL: {BASE}")
+    print(f"   2. Add Provider → API Key:  ollama")
+    print(f"   3. Add Search  → Type: DuckDuckGo → URL: {BASE}")
     print(f"   4. Page Reader URL:          {BASE}")
+    print(f"\n🤖 Agentic Mode: AI can search & read web pages autonomously!")
+    print(f"   Toggle Search ON in chat → AI decides when to search")
     print(f"\n🔧 Routes: /v1/* → Ollama | /search → Jina+DDG | /crawl → Crawl4AI+Jina")
-    print(f"\n🔍 Search: Jina AI (fast, unlimited) → DuckDuckGo (fallback)")
-    print(f"🕷️ Crawl: Crawl4AI → Jina Reader (fallback)")
+    print(f"💡 reasoning_effort: Send in chat request body (high/none)")
     print("=" * 60)
 
 # -------------------- HEALTH MONITOR --------------------

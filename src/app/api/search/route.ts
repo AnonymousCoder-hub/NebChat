@@ -25,31 +25,7 @@ export async function GET(req: NextRequest) {
 
     let results: { title: string; url: string; snippet: string; content?: string }[] = [];
 
-    switch (providerType) {
-      case "duckduckgo":
-        results = await searchDuckDuckGo(query, providerUrl, maxResults);
-        break;
-      case "searxng":
-        results = await searchSearXNG(query, providerUrl, maxResults);
-        break;
-      case "brave":
-        results = await searchBrave(query, apiKey, maxResults);
-        break;
-      case "serper":
-        results = await searchSerper(query, apiKey, maxResults);
-        break;
-      case "tavily":
-        results = await searchTavily(query, apiKey, maxResults);
-        break;
-      case "google_cse":
-        results = await searchGoogleCSE(query, apiKey, cxId, maxResults);
-        break;
-      default:
-        return NextResponse.json(
-          { error: `Unknown search provider type: ${providerType}` },
-          { status: 400 }
-        );
-    }
+    results = await executeSearch(providerType, query, providerUrl, apiKey, cxId, maxResults);
 
     // Read top pages if requested
     if (readPages && pageReaderUrl && results.length > 0) {
@@ -77,6 +53,88 @@ export async function GET(req: NextRequest) {
   }
 }
 
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const {
+      query,
+      provider,
+      maxResults = 8,
+      fetchContent = false,
+      contentPages = 3,
+      pageReaderUrl = "",
+    } = body;
+
+    if (!query) {
+      return NextResponse.json(
+        { error: "Query is required" },
+        { status: 400 }
+      );
+    }
+
+    const providerType = provider?.type || "duckduckgo";
+    const providerUrl = provider?.baseUrl || provider?.url || "";
+    const apiKey = provider?.apiKey || "";
+    const cxId = provider?.cxId || "";
+
+    let results = await executeSearch(
+      providerType, query, providerUrl, apiKey, cxId, maxResults
+    );
+
+    // Read top pages if requested
+    if (fetchContent && pageReaderUrl && results.length > 0) {
+      const pagesToRead = Math.min(contentPages, results.length);
+      const topResults = results.slice(0, pagesToRead);
+      const readPromises = topResults.map(async (result) => {
+        try {
+          const pageContent = await readPage(result.url, pageReaderUrl);
+          if (pageContent) {
+            result.content = pageContent.slice(0, 3000);
+          }
+        } catch {
+          // Page reading failed, that's okay
+        }
+        return result;
+      });
+
+      await Promise.allSettled(readPromises);
+    }
+
+    return NextResponse.json({ results, query, provider: providerType });
+  } catch (error) {
+    console.error("Search API error:", error);
+    const message = error instanceof Error ? error.message : "Search failed";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+// ==================== SEARCH EXECUTION ====================
+async function executeSearch(
+  providerType: string,
+  query: string,
+  providerUrl: string,
+  apiKey: string,
+  cxId: string,
+  maxResults: number
+): Promise<{ title: string; url: string; snippet: string; content?: string }[]> {
+  switch (providerType) {
+    case "duckduckgo":
+      return searchDuckDuckGo(query, providerUrl, maxResults);
+    case "searxng":
+      return searchSearXNG(query, providerUrl, maxResults);
+    case "brave":
+      return searchBrave(query, apiKey, maxResults);
+    case "serper":
+      return searchSerper(query, apiKey, maxResults);
+    case "tavily":
+      return searchTavily(query, apiKey, maxResults);
+    case "google_cse":
+      return searchGoogleCSE(query, apiKey, cxId, maxResults);
+    default:
+      throw new Error(`Unknown search provider type: ${providerType}`);
+  }
+}
+
 // --- DuckDuckGo via Colab proxy (Jina AI + DDG fallback) ---
 async function searchDuckDuckGo(
   query: string,
@@ -98,10 +156,10 @@ async function searchDuckDuckGo(
 
   const data = await response.json();
   return (data.results || []).map(
-    (r: { title?: string; url?: string; content?: string; href?: string; body?: string }) => ({
+    (r: { title?: string; url?: string; content?: string; description?: string; href?: string; body?: string }) => ({
       title: r.title || "",
       url: r.url || r.href || "",
-      snippet: r.content || r.body || "",
+      snippet: r.content || r.body || r.description || "",
     })
   );
 }
@@ -118,7 +176,6 @@ async function searchSearXNG(
 
   const url = `${baseUrl.replace(/\/+$/, "")}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
 
-  // Retry logic for SearXNG (may return 503 if not ready)
   let lastError: Error | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -277,7 +334,6 @@ async function readPage(
     if (!response.ok) return null;
 
     const data = await response.json();
-    // Extract markdown content from Crawl4AI or Jina Reader response
     if (data.content?.markdown) {
       return data.content.markdown.slice(0, 5000);
     }

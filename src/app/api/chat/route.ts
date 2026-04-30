@@ -14,6 +14,7 @@ export async function POST(req: NextRequest) {
       thinkingEnabled,
       searchResults,
       systemPrompt,
+      agentic,
     } = body;
 
     if (!baseUrl || !model) {
@@ -48,13 +49,12 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // If search results are provided, inject them as a context message
-    // BEFORE the last user message, as a separate system context
-    if (searchResults && searchResults.length > 0) {
+    // If agentic mode is on, skip injecting search results — the bridge handles it
+    // If NOT agentic, inject search results as context (frontend-side search)
+    if (!agentic && searchResults && searchResults.length > 0) {
       const lastUserIdx = processedMessages.map(m => m.role).lastIndexOf("user");
       if (lastUserIdx !== -1) {
         const searchContext = buildSearchContext(searchResults);
-        // Insert search context right before the last user message
         processedMessages.splice(lastUserIdx, 0, {
           role: "system",
           content: searchContext,
@@ -75,16 +75,18 @@ export async function POST(req: NextRequest) {
     if (temperature !== undefined) requestBody.temperature = temperature;
     if (max_tokens !== undefined) requestBody.max_tokens = max_tokens;
 
-    // Add thinking/reasoning parameters for supported models
+    // Add reasoning_effort parameter
+    // When thinking is enabled: "high" for deep reasoning
+    // When thinking is disabled: "none" to skip thinking entirely
     if (thinkingEnabled) {
-      // Ollama reasoning effort
       requestBody.reasoning_effort = "high";
-      // Some providers use different parameter names
-      if (normalizedUrl.includes("ollama") || normalizedUrl.includes("127.0.0.1") || normalizedUrl.includes("localhost") || normalizedUrl.includes("ngrok")) {
-        // Ollama-specific: add think parameter
-        // The think parameter is handled via the chat template in Ollama
-        // No extra param needed for /v1/chat/completions
-      }
+    } else {
+      requestBody.reasoning_effort = "none";
+    }
+
+    // Pass agentic flag for the bridge to handle tool calling
+    if (agentic) {
+      requestBody.agentic = true;
     }
 
     // Determine the API endpoint
@@ -188,7 +190,6 @@ function buildSearchContext(
     context += `--- Source ${i + 1}: ${result.title} ---\n`;
     context += `URL: ${result.url}\n`;
     if (result.content) {
-      // Truncate long content to avoid overwhelming the context
       const maxContent = 2000;
       context += result.content.length > maxContent
         ? result.content.slice(0, maxContent) + "..."

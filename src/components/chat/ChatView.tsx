@@ -291,7 +291,9 @@ export function ChatView() {
       model: string,
       provider: { baseUrl: string; apiKey: string },
       thinkingOn: boolean,
-      searchResults?: SearchResult[]
+      searchResults?: SearchResult[],
+      agentic?: boolean,
+      onStreamStart?: () => void,
     ): Promise<{
       content: string;
       thinking: string;
@@ -300,16 +302,17 @@ export function ChatView() {
       const session = sessionRef.current;
       if (!session.isStreaming) return null;
 
-      // Create abort controller with 5-minute timeout
+      // Create abort controller with 5-minute timeout (8 min for agentic)
+      const timeout = agentic ? 480_000 : 300_000;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         controller.abort();
         toast({
           title: "Response timed out",
-          description: "The AI took too long to respond (5 min limit)",
+          description: agentic ? "The AI took too long (8 min limit for agentic search)" : "The AI took too long to respond (5 min limit)",
           variant: "destructive",
         });
-      }, 300_000);
+      }, timeout);
       session.abortController = controller;
 
       try {
@@ -323,11 +326,14 @@ export function ChatView() {
             apiKey: provider.apiKey,
             stream: true,
             thinkingEnabled: thinkingOn,
-            searchResults,
-            searchEnabled: useAppStore.getState().searchEnabled,
+            searchResults: agentic ? undefined : searchResults,
+            agentic: agentic || false,
           }),
           signal: controller.signal,
         });
+
+        // Stream started — hide searching indicator for agentic mode
+        if (onStreamStart) onStreamStart();
 
         if (!response.ok) {
           const errorData = await response
@@ -501,7 +507,7 @@ export function ChatView() {
       setInput("");
       if (inputRef.current) inputRef.current.style.height = "44px";
 
-      // === AGENTIC SEARCH FLOW ===
+      // === SEARCH FLOW ===
       let searchResults: SearchResult[] = [];
       const currentSearchEnabled = useAppStore.getState().searchEnabled;
       const currentSearchProvider = searchProviders.find(
@@ -510,7 +516,21 @@ export function ChatView() {
           p.isEnabled
       );
 
-      if (currentSearchEnabled && currentSearchProvider) {
+      // Agentic mode: AI decides when to search (bridge handles tools)
+      // Used for duckduckgo/Colab bridge providers with built-in search
+      const isAgentic =
+        currentSearchEnabled &&
+        currentSearchProvider &&
+        (currentSearchProvider.type === "duckduckgo" ||
+          currentSearchProvider.type === "searxng");
+
+      if (isAgentic) {
+        // Agentic mode: bridge will handle search/crawl autonomously
+        setSearchingNow(true);
+        setSearchProgress("AI is searching the web...");
+        // No frontend-side search needed — the bridge handles it
+      } else if (currentSearchEnabled && currentSearchProvider) {
+        // Non-agentic search: frontend searches first, then injects results
         setSearchingNow(true);
         setSearchProgress("Generating search queries...");
 
@@ -627,7 +647,13 @@ export function ChatView() {
         currentModelId,
         provider,
         currentThinkingEnabled,
-        searchResults.length > 0 ? searchResults : undefined
+        isAgentic ? undefined : (searchResults.length > 0 ? searchResults : undefined),
+        isAgentic ? true : undefined,
+        // onStreamStart: hide searching indicator when bridge starts streaming
+        isAgentic ? () => {
+          setSearchingNow(false);
+          setSearchProgress("");
+        } : undefined,
       );
 
       if (!result) {
@@ -939,9 +965,11 @@ export function ChatView() {
               ref={inputRef}
               placeholder={
                 searchingNow
-                  ? "Searching..."
+                  ? searchProgress || "Searching..."
                   : searchEnabled && activeSearchProvider
-                    ? "Ask — AI will search the web..."
+                    ? activeSearchProvider.type === "duckduckgo" || activeSearchProvider.type === "searxng"
+                      ? "Ask — AI will search when needed..."
+                      : "Ask — AI will search the web..."
                     : "Message..."
               }
               value={input}
