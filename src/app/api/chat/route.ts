@@ -49,7 +49,23 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // If agentic mode is on, skip injecting search results — the bridge handles it
+    // If agentic mode is on, inject a system prompt telling the AI about its search capabilities
+    // This is CRITICAL — without it, the AI doesn't know it can search and will say "I can't access the internet"
+    if (agentic) {
+      const agenticSystemPrompt = `You are an AI assistant with web search and page reading capabilities. You have access to the following tools:
+- web_search: Search the web for current, up-to-date information. Returns titles, URLs, and snippets.
+- read_page: Read the full content of a web page as markdown. Use for detailed info from URLs found via search.
+
+CRITICAL RULES:
+1. When the user asks about current events, stock prices, weather, news, recent data, or ANY time-sensitive information, you MUST use the web_search tool FIRST before responding. Do NOT say you cannot access the internet — you CAN and MUST search.
+2. When the user asks "what is the price of X", "what happened today", "latest news about Y", or similar real-time queries, ALWAYS call web_search immediately.
+3. After searching, if you need more detailed information from a specific URL, use the read_page tool to get the full content.
+4. Only respond without searching if the question is about general knowledge, math, coding, or topics that don't require current data.
+5. Never say "I don't have access to real-time data" or "I can't browse the internet" — you CAN search using your tools.
+6. Always cite your sources by including URLs from the search results in your response.`;
+      processedMessages.unshift({ role: "system", content: agenticSystemPrompt });
+    }
+
     // If NOT agentic, inject search results as context (frontend-side search)
     if (!agentic && searchResults && searchResults.length > 0) {
       const lastUserIdx = processedMessages.map(m => m.role).lastIndexOf("user");

@@ -34,6 +34,7 @@ import {
   Zap,
   ExternalLink,
   MessageSquare,
+  Settings,
 } from "lucide-react";
 import { useState, useRef, useEffect, useCallback, memo } from "react";
 import ReactMarkdown from "react-markdown";
@@ -106,6 +107,8 @@ export function ChatView() {
   const setThinkingEnabled = useAppStore((s) => s.setThinkingEnabled);
   const setSearchEnabled = useAppStore((s) => s.setSearchEnabled);
   const setSidebarOpen = useAppStore((s) => s.setSidebarOpen);
+  const setSwarmConfigOpen = useAppStore((s) => s.setSwarmConfigOpen);
+  const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
 
   // --- Local UI state ---
   const [input, setInput] = useState("");
@@ -827,6 +830,28 @@ export function ChatView() {
               {activeProvider.name}
             </Badge>
           )}
+          {/* Swarm config button */}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-fuchsia-500 hover:text-fuchsia-600 hover:bg-fuchsia-500/10"
+            onClick={() => setSwarmConfigOpen(true)}
+            aria-label="Swarm config"
+            title="Agentic Swarm"
+          >
+            <Zap className="h-4 w-4" />
+          </Button>
+          {/* Settings button (for quick access on desktop) */}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-muted-foreground hover:text-foreground"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Settings"
+            title="Settings"
+          >
+            <Settings className="h-4 w-4" />
+          </Button>
         </div>
       </div>
 

@@ -291,8 +291,8 @@ export function HomeView() {
 
   // ---- Dashboard ----
   return (
-    <div className="flex-1 overflow-y-auto min-h-0">
-      <div className="mx-auto max-w-6xl p-3 sm:p-6 lg:p-8 space-y-6 sm:space-y-8">
+    <div className="flex-1 overflow-y-auto min-h-0 overscroll-contain">
+      <div className="mx-auto max-w-6xl p-3 sm:p-6 lg:p-8 space-y-6 sm:space-y-8 pb-8">
         {/* ── Hero Section ────────────────────────────────────────── */}
         <motion.section
           initial={{ opacity: 0, y: -8 }}

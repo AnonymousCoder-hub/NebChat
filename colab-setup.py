@@ -257,7 +257,25 @@ AGENTIC_TOOLS = [
 
 # ==================== TOOL EXECUTION ====================
 def _tool_web_search(query):
-    """Jina Search -> DuckDuckGo fallback"""
+    """DuckDuckGo (primary) -> Jina Search -> Google HTML scraping fallback"""
+    # Primary: DuckDuckGo via library (free, unlimited, reliable)
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            ddg_results = list(ddgs.text(query, max_results=8))
+        if ddg_results:
+            results = []
+            for r in ddg_results:
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", "")[:500],
+                })
+            return json.dumps(results)
+    except Exception as e:
+        print(f"[AGENTIC] DDG error: {e}", flush=True)
+
+    # Fallback 1: Jina AI Search
     try:
         url = f"{JINA_SEARCH_URL}{urllib.parse.quote(query)}"
         headers = {"Accept": "application/json", "X-No-Cache": "true"}
@@ -278,22 +296,32 @@ def _tool_web_search(query):
             return json.dumps(results)
     except Exception as e:
         print(f"[AGENTIC] Jina error: {e}", flush=True)
-    # DDG fallback
+
+    # Fallback 2: Google HTML scraping (free, unlimited)
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            ddg_results = list(ddgs.text(query, max_results=8))
+        google_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num=8"
+        req = urllib.request.Request(google_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        import re
         results = []
-        for r in ddg_results:
-            results.append({
-                "title": r.get("title", ""),
-                "url": r.get("href", ""),
-                "snippet": r.get("body", "")[:500],
-            })
-        return json.dumps(results)
+        # Extract search result blocks from Google HTML
+        for match in re.finditer(r'<a href="/url\?q=(https?://[^&"]+)&[^"]*"[^>]*>(.*?)</a>', html):
+            url = urllib.parse.unquote(match.group(1))
+            title = re.sub(r'<[^>]+>', '', match.group(2)).strip()
+            if url and title and not url.startswith("https://www.google.com"):
+                # Try to get snippet from nearby text
+                snippet_match = re.search(re.escape(url) + r'.*?(?:<span[^>]*>|<div[^>]*>)(.*?)(?:</span>|</div>)', html[match.start():match.start()+2000])
+                snippet = re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip()[:300] if snippet_match else ""
+                results.append({"title": title, "url": url, "snippet": snippet})
+        if results:
+            return json.dumps(results[:8])
     except Exception as e:
-        print(f"[AGENTIC] DDG error: {e}", flush=True)
-        return json.dumps({"error": "Search failed"})
+        print(f"[AGENTIC] Google scraping error: {e}", flush=True)
+
+    return json.dumps({"error": "All search methods failed"})
 
 def _tool_read_page(url):
     """Crawl4AI -> Jina Reader fallback"""
@@ -466,10 +494,33 @@ def _ollama_call(body_json):
     with urllib.request.urlopen(req, timeout=300) as resp:
         return json.loads(resp.read())
 
+AGENTIC_SYSTEM_PROMPT = """You are an AI assistant with web search and page reading capabilities. You have access to the following tools:
+- web_search: Search the web for current, up-to-date information. Returns titles, URLs, and snippets.
+- read_page: Read the full content of a web page as markdown. Use for detailed info from URLs found via search.
+
+CRITICAL RULES:
+1. When the user asks about current events, stock prices, weather, news, recent data, or ANY time-sensitive information, you MUST use the web_search tool FIRST before responding. Do NOT say you cannot access the internet — you CAN and MUST search.
+2. When the user asks "what is the price of X", "what happened today", "latest news about Y", or similar real-time queries, ALWAYS call web_search immediately.
+3. After searching, if you need more detailed information from a specific URL, use the read_page tool to get the full content.
+4. Only respond without searching if the question is about general knowledge, math, coding, or topics that don't require current data.
+5. Never say "I don't have access to real-time data" or "I can't browse the internet" — you CAN search using your tools.
+6. Always cite your sources by including URLs from the search results in your response."""
+
 def _handle_agentic(body_json, should_stream):
     """Agentic loop: AI decides when to search/read, executes tools, returns final answer."""
     messages = list(body_json.get("messages", []))
     model = body_json.get("model", "qwen3:8b")
+
+    # Inject agentic system prompt if no system message exists
+    has_system = any(m.get("role") == "system" for m in messages)
+    if not has_system:
+        messages.insert(0, {"role": "system", "content": AGENTIC_SYSTEM_PROMPT})
+    else:
+        # Prepend agentic instructions to existing system prompt
+        for m in messages:
+            if m.get("role") == "system":
+                m["content"] = AGENTIC_SYSTEM_PROMPT + "\n\n" + m.get("content", "")
+                break
 
     # Inject tools
     body_json["tools"] = AGENTIC_TOOLS
@@ -597,7 +648,25 @@ def search():
     if not query:
         return jsonify({"error": "Missing query parameter 'q'"}), 400
 
-    # Jina AI Search
+    # Primary: DuckDuckGo (free, unlimited, reliable)
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            ddg_results = list(ddgs.text(query, max_results=max_results))
+        if ddg_results:
+            results = []
+            for r in ddg_results:
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", r.get("link", "")),
+                    "description": r.get("body", r.get("snippet", "")),
+                    "content": r.get("body", ""),
+                })
+            return jsonify({"query": query, "source": "duckduckgo", "results": results})
+    except Exception as exc:
+        print(f"[SEARCH] DDG failed: {exc}", flush=True)
+
+    # Fallback 1: Jina AI Search
     try:
         jina_url = f"{JINA_SEARCH_URL}{urllib.parse.quote(query)}"
         jina_headers = {"Accept": "application/json", "X-Return-Format": "search", "X-No-Cache": "true"}
@@ -621,25 +690,32 @@ def search():
     except Exception as exc:
         print(f"[SEARCH] Jina failed: {exc}", flush=True)
 
-    # DuckDuckGo fallback
+    # Fallback 2: Google HTML scraping (free, unlimited)
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            ddg_results = list(ddgs.text(query, max_results=max_results))
+        google_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num={max_results}"
+        req = urllib.request.Request(google_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        import re as _re
         results = []
-        for r in ddg_results:
-            results.append({
-                "title": r.get("title", ""),
-                "url": r.get("href", r.get("link", "")),
-                "description": r.get("body", r.get("snippet", "")),
-                "content": r.get("body", ""),
-            })
-        return jsonify({"query": query, "source": "duckduckgo", "results": results})
+        for match in _re.finditer(r'<a href="/url\?q=(https?://[^&"]+)&[^"]*"[^>]*>(.*?)</a>', html):
+            url = urllib.parse.unquote(match.group(1))
+            title = _re.sub(r'<[^>]+>', '', match.group(2)).strip()
+            if url and title and not url.startswith("https://www.google.com"):
+                snippet_match = _re.search(_re.escape(url) + r'.*?(?:<span[^>]*>|<div[^>]*>)(.*?)(?:</span>|</div>)', html[match.start():match.start()+2000])
+                snippet = _re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip()[:300] if snippet_match else ""
+                results.append({"title": title, "url": url, "description": snippet, "content": snippet})
+        if results:
+            return jsonify({"query": query, "source": "google_scrape", "results": results[:max_results]})
     except Exception as exc:
-        return jsonify({
-            "query": query, "source": "none", "results": [],
-            "error": f"Search failed: {exc}",
-        }), 502
+        print(f"[SEARCH] Google scraping failed: {exc}", flush=True)
+
+    return jsonify({
+        "query": query, "source": "none", "results": [],
+        "error": "All search methods failed",
+    }), 502
 
 @app.route("/crawl", methods=["POST"])
 def crawl():

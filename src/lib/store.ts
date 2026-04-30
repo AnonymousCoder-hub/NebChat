@@ -25,6 +25,7 @@ interface AppState {
   selectedProviderId: string | null;
   sidebarOpen: boolean;
   settingsOpen: boolean;
+  swarmConfigOpen: boolean;
   isStreaming: boolean;
   thinkingEnabled: boolean;
   searchEnabled: boolean;
@@ -36,6 +37,7 @@ interface AppState {
   setActiveView: (view: AppView) => void;
   setSidebarOpen: (open: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
+  setSwarmConfigOpen: (open: boolean) => void;
 
   // Provider actions
   addProvider: (provider: APIProvider) => void;
@@ -113,6 +115,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedProviderId: null,
   sidebarOpen: true,
   settingsOpen: false,
+  swarmConfigOpen: false,
   isStreaming: false,
   thinkingEnabled: true,
   searchEnabled: false,
@@ -159,6 +162,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
   setSettingsOpen: (open) => set({ settingsOpen: open }),
+  setSwarmConfigOpen: (open) => set({ swarmConfigOpen: open }),
 
   // Provider actions
   addProvider: (provider) => {
