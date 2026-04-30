@@ -4,6 +4,10 @@
 # Paste this ENTIRE script in a single Colab cell and run.
 
 import os,sys,time,json,subprocess,threading,queue,shutil,urllib.request,urllib.error,urllib.parse
+# Auto-install deps BEFORE importing them (Colab doesn't have these pre-installed)
+for _p in ["flask","flask-cors","pyngrok","requests"]:
+    try: __import__(_p.split("-")[0].replace("-","_"))
+    except: subprocess.run([sys.executable,"-m","pip","install","-q",_p],check=True)
 from datetime import datetime,timezone
 from flask import Flask,Response,request,jsonify,stream_with_context
 from flask_cors import CORS
@@ -11,7 +15,7 @@ import requests as req_lib
 
 # ── CONFIG ──
 NGROK_TOKEN="YOUR_NGROK_AUTH_TOKEN_HERE"  # <-- Replace!
-P_OL,P_BR=11434,5000; MODELS=["qwen3:8b"]
+P_OL,P_BR=11434,5000; MODELS=["qwen3.5:9b","qwen3.5:0.8b"]
 OL_ENV={"OLLAMA_KEEP_ALIVE":"-1","OLLAMA_NUM_PARALLEL":"4","OLLAMA_MAX_LOADED_MODELS":"3","OLLAMA_GPU_LAYERS":"999","OLLAMA_FLASH_ATTENTION":"1","OLLAMA_KV_CACHE_TYPE":"q8_0","OLLAMA_CONTEXT_LENGTH":"8192"}
 OL=f"http://localhost:{P_OL}"; MAXR=10
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
