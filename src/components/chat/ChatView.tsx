@@ -116,12 +116,14 @@ export function ChatView() {
   const [searchingNow, setSearchingNow] = useState(false);
   const [searchProgress, setSearchProgress] = useState("");
 
-  // Streaming display state — updated from refs at ~30fps
+  // Streaming display state — updated from refs via smooth character-by-character reveal
   const [streamingContent, setStreamingContent] = useState("");
   const [streamingThinking, setStreamingThinking] = useState("");
   const [streamingActive, setStreamingActive] = useState(false);
   const [streamingTps, setStreamingTps] = useState(0);
   const [streamingMsgId, setStreamingMsgId] = useState("");
+  // True while the smooth typing animation is running (during SSE + catch-up after stream ends)
+  const [isRevealingActive, setIsRevealingActive] = useState(false);
 
   // Ref-based streaming state (avoids stale closures in async callbacks)
   const sessionRef = useRef<StreamSession>({
@@ -142,6 +144,11 @@ export function ChatView() {
   const tpsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isMountedRef = useRef(true);
 
+  // Smooth character-by-character reveal tracking
+  const displayedContentLenRef = useRef(0);
+  const displayedThinkingLenRef = useRef(0);
+  const isRevealingRef = useRef(false);
+
   // Derived values
   const activeProvider = providers.find(
     (p) => p.id === (activeConversation?.providerId || selectedProviderId)
@@ -150,21 +157,70 @@ export function ChatView() {
     (p) => p.id === activeSearchProviderId && p.isEnabled
   );
 
-  // --- RAF-based UI update loop for smooth streaming at ~30fps ---
-  // Reads from sessionRef and pushes to React state for rendering
+  // --- RAF-based UI update loop for smooth character-by-character streaming ---
+  // Instead of pushing all accumulated text at once (which causes chunky bursts),
+  // we advance a "display position" by a few chars per frame, creating a smooth
+  // typing animation even when SSE data arrives in large chunks.
   useEffect(() => {
+    const CHARS_PER_FRAME = 3; // Base speed: ~180 chars/sec at 60fps
+    const MIN_FRAME_INTERVAL = 16; // ~60fps cap
+
     let lastUpdate = 0;
-    const FRAME_INTERVAL = 33; // ~30fps
 
     const loop = () => {
       const now = Date.now();
       const session = sessionRef.current;
-      if (session.isStreaming && now - lastUpdate >= FRAME_INTERVAL) {
+      const isActive = session.isStreaming || isRevealingRef.current;
+
+      if (isActive && now - lastUpdate >= MIN_FRAME_INTERVAL) {
         lastUpdate = now;
-        setStreamingContent(session.content);
-        setStreamingThinking(session.thinking);
-        setStreamingTps(session.tps);
+
+        const contentBuffer = session.content;
+        const thinkingBuffer = session.thinking;
+        let contentChanged = false;
+        let thinkingChanged = false;
+
+        // Advance content display position
+        const contentTarget = contentBuffer.length;
+        const currentContentLen = displayedContentLenRef.current;
+        if (currentContentLen < contentTarget) {
+          // Adaptive speed: reveal faster when there's a lot queued up
+          const queueSize = contentTarget - currentContentLen;
+          const speed = queueSize > 200 ? 12 : queueSize > 100 ? 8 : queueSize > 50 ? 5 : CHARS_PER_FRAME;
+          const newLen = Math.min(currentContentLen + speed, contentTarget);
+          displayedContentLenRef.current = newLen;
+          setStreamingContent(contentBuffer.slice(0, newLen));
+          contentChanged = true;
+        }
+
+        // Advance thinking display position
+        const thinkingTarget = thinkingBuffer.length;
+        const currentThinkingLen = displayedThinkingLenRef.current;
+        if (currentThinkingLen < thinkingTarget) {
+          const queueSize = thinkingTarget - currentThinkingLen;
+          const speed = queueSize > 200 ? 12 : queueSize > 100 ? 8 : queueSize > 50 ? 5 : CHARS_PER_FRAME;
+          const newLen = Math.min(currentThinkingLen + speed, thinkingTarget);
+          displayedThinkingLenRef.current = newLen;
+          setStreamingThinking(thinkingBuffer.slice(0, newLen));
+          thinkingChanged = true;
+        }
+
+        // Update TPS while streaming
+        if (session.isStreaming) {
+          setStreamingTps(session.tps);
+        }
+
+        // Check if reveal animation is complete (stream ended + all chars shown)
+        if (
+          !session.isStreaming &&
+          displayedContentLenRef.current >= contentTarget &&
+          displayedThinkingLenRef.current >= thinkingTarget
+        ) {
+          isRevealingRef.current = false;
+          setIsRevealingActive(false);
+        }
       }
+
       rafIdRef.current = requestAnimationFrame(loop);
     };
 
@@ -279,10 +335,15 @@ export function ChatView() {
           : undefined
       );
     }
+    // On manual stop: show all buffered content immediately (skip smooth reveal)
+    displayedContentLenRef.current = session.content.length;
+    displayedThinkingLenRef.current = session.thinking.length;
+    isRevealingRef.current = false;
     session.isStreaming = false;
     setStreamingActive(false);
     setStreamingContent(session.content);
     setStreamingThinking(session.thinking);
+    setIsRevealingActive(false);
     setIsStreaming(false);
   }, [activeConversationId, updateMessage, setIsStreaming]);
 
@@ -394,13 +455,11 @@ export function ChatView() {
               // Skip malformed JSON
             }
           }
-          // RAF loop handles UI updates at ~30fps — no manual setState here
+          // RAF loop handles smooth character-by-character reveal — no manual setState here
         }
 
-        // Final state push so the last chunk is visible immediately
-        setStreamingContent(session.content);
-        setStreamingThinking(session.thinking);
-        setStreamingTps(session.tps);
+        // No final state push — the RAF loop continues the smooth reveal
+        // and will catch up after the stream ends
 
         const totalTimeMs = Date.now() - session.startTime;
         const totalTokenCount = session.tokenTimestamps.length;
@@ -623,12 +682,18 @@ export function ChatView() {
         tps: 0,
       };
 
+      // Reset smooth reveal tracking
+      displayedContentLenRef.current = 0;
+      displayedThinkingLenRef.current = 0;
+      isRevealingRef.current = true;
+
       // Push initial streaming state
       setStreamingActive(true);
       setStreamingContent("");
       setStreamingThinking("");
       setStreamingTps(0);
       setStreamingMsgId(assistantMessageId);
+      setIsRevealingActive(true);
 
       // Build message history (limit to last 20 to prevent context overflow)
       const conv = useAppStore.getState().conversations.find(
@@ -662,14 +727,19 @@ export function ChatView() {
       if (!result) {
         sessionRef.current.isStreaming = false;
         sessionRef.current.abortController = null;
+        // Show all buffered content immediately on error/cancel
+        displayedContentLenRef.current = sessionRef.current.content.length;
+        displayedThinkingLenRef.current = sessionRef.current.thinking.length;
+        isRevealingRef.current = false;
         setStreamingActive(false);
         setStreamingContent(sessionRef.current.content);
         setStreamingThinking(sessionRef.current.thinking);
+        setIsRevealingActive(false);
         setIsStreaming(false);
         return;
       }
 
-      // Save the final response
+      // Save the final response to the store
       updateMessage(
         conversationId,
         assistantMessageId,
@@ -678,11 +748,13 @@ export function ChatView() {
         result.tokenStats
       );
 
+      // End SSE stream but keep the smooth reveal animation running
+      // so remaining buffered text appears character-by-character
       sessionRef.current.isStreaming = false;
       sessionRef.current.abortController = null;
+      isRevealingRef.current = true;
       setStreamingActive(false);
-      setStreamingContent(result.content);
-      setStreamingThinking(result.thinking);
+      setIsRevealingActive(true);
       setIsStreaming(false);
     },
     [
@@ -718,8 +790,9 @@ export function ChatView() {
   const isCurrentlyStreaming = streamingActive;
   const messages = activeConversation?.messages || [];
   const lastMsg = messages[messages.length - 1];
+  // isLastStreaming: true while SSE is active OR while smooth reveal animation is running
   const isLastStreaming =
-    isCurrentlyStreaming &&
+    (isCurrentlyStreaming || isRevealingActive) &&
     lastMsg?.role === "assistant" &&
     streamingMsgId === lastMsg?.id;
 
@@ -892,6 +965,9 @@ export function ChatView() {
           {messages.map((message) => {
             const isThisStreaming =
               isLastStreaming && message.id === lastMsg.id;
+            // isTypingAnimation: cursor blinks during reveal even after SSE ends
+            const isTypingAnimation =
+              isRevealingActive && message.id === lastMsg?.id && message.role === "assistant";
             // Overlay streaming state for the last assistant message
             const displayContent = isThisStreaming
               ? streamingContent
@@ -917,9 +993,10 @@ export function ChatView() {
                 }
                 isCopied={copiedId === message.id}
                 onCopy={handleCopyMessage}
-                isStreaming={isThisStreaming}
-                showTps={isThisStreaming}
-                liveTps={isThisStreaming ? streamingTps : 0}
+                isStreaming={isThisStreaming && streamingActive}
+                isTypingAnimation={isTypingAnimation}
+                showTps={isThisStreaming && streamingActive}
+                liveTps={isThisStreaming && streamingActive ? streamingTps : 0}
               />
             );
           })}
@@ -1070,14 +1147,17 @@ export function ChatView() {
 function ThinkingBlock({
   thinking,
   isStreaming,
+  isTypingAnimation,
 }: {
   thinking: string;
   isStreaming: boolean;
+  isTypingAnimation?: boolean;
 }) {
   const [userCollapsed, setUserCollapsed] = useState(false);
 
   // Auto-open while streaming; respect user choice when not streaming
   const isOpen = isStreaming ? true : !userCollapsed;
+  const showCursor = isStreaming || !!isTypingAnimation;
 
   return (
     <Collapsible open={isOpen} onOpenChange={(open) => { if (!open) setUserCollapsed(true); else setUserCollapsed(false); }}>
@@ -1094,7 +1174,7 @@ function ThinkingBlock({
       <CollapsibleContent>
         <div className="mt-2 rounded-lg border border-amber-200/50 dark:border-amber-800/30 bg-amber-50/50 dark:bg-amber-950/20 px-3 py-2.5 text-xs leading-relaxed text-amber-900/80 dark:text-amber-100/80 max-h-[400px] overflow-y-auto">
           <div className="whitespace-pre-wrap break-words">{thinking}</div>
-          {isStreaming && (
+          {showCursor && (
             <span className="inline-block w-1.5 h-3 bg-amber-500/70 animate-pulse ml-0.5 align-text-bottom" />
           )}
         </div>
@@ -1214,6 +1294,7 @@ interface MessageBubbleProps {
   isCopied: boolean;
   onCopy: (id: string, content: string) => void;
   isStreaming: boolean;
+  isTypingAnimation?: boolean;
   showTps: boolean;
   liveTps: number;
 }
@@ -1229,12 +1310,14 @@ const MemoizedMessageBubble = memo(function MessageBubble({
   isCopied,
   onCopy,
   isStreaming,
+  isTypingAnimation,
   showTps,
   liveTps,
 }: MessageBubbleProps) {
   const isUser = role === "user";
   const hasThinking = !!thinking;
   const hasSearchResults = !!searchResults?.length;
+  const showTypingCursor = isStreaming || !!isTypingAnimation;
 
   // Strip [SEARCH: ...] tags from display content
   const displayContent = isUser ? content : stripSearchTags(content);
@@ -1271,6 +1354,7 @@ const MemoizedMessageBubble = memo(function MessageBubble({
                 <ThinkingBlock
                   thinking={thinking!}
                   isStreaming={isStreaming && !content}
+                  isTypingAnimation={isTypingAnimation && !content}
                 />
               )}
               {/* Search results block */}
@@ -1279,7 +1363,7 @@ const MemoizedMessageBubble = memo(function MessageBubble({
               )}
               {/* Markdown content */}
               <div
-                className={`prose-nebchat prose prose-sm dark:prose-invert max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 ${isStreaming ? "streaming-cursor" : ""}`}
+                className={`prose-nebchat prose prose-sm dark:prose-invert max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 ${showTypingCursor ? "streaming-cursor" : ""}`}
               >
                 <ReactMarkdown
                   remarkPlugins={[remarkMath]}
@@ -1375,7 +1459,7 @@ const MemoizedMessageBubble = memo(function MessageBubble({
                   }}
                 >
                   {displayContent ||
-                    (isStreaming && !hasThinking ? "▍" : "")}
+                    (showTypingCursor && !hasThinking ? "▍" : "")}
                 </ReactMarkdown>
               </div>
             </div>

@@ -81,18 +81,23 @@
   background: oklch(0.5 0 0 / 0.6);
 }
 
-/* Streaming cursor animation */
+/* Streaming cursor animation — smooth blink like ChatGPT */
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
 }
 
+@keyframes cursor-breathe {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 0.2; }
+}
+
 .streaming-cursor::after {
-  content: "▊";
-  animation: blink 1s step-end infinite;
+  content: "▎";
+  animation: cursor-breathe 1s ease-in-out infinite;
   color: oklch(0.5 0.15 250);
-  font-weight: 400;
-  margin-left: 1px;
+  font-weight: 300;
+  margin-left: 0px;
 }
 
 .dark .streaming-cursor::after {

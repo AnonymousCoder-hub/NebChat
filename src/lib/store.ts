@@ -53,9 +53,14 @@ interface AppState {
     agents: {
       name: string;
       role: string;
+      systemPrompt?: string;
       modelId: string;
       providerId: string;
+      searchEnabled?: boolean;
+      searchLimit?: number;
+      priority?: number;
       thinkingEnabled?: boolean;
+      maxIterations?: number;
     }[],
     maxSteps: number
   ) => string;
@@ -269,14 +274,14 @@ export const useAppStore = create<AppState>((set, get) => ({
           id: storage.generateId(),
           name: a.name,
           role: a.role,
-          systemPrompt: "",
+          systemPrompt: a.systemPrompt ?? "",
           modelId: a.modelId,
           providerId: a.providerId,
-          searchEnabled: false,
-          searchLimit: 5,
-          priority: 1,
+          searchEnabled: a.searchEnabled ?? false,
+          searchLimit: a.searchLimit ?? 5,
+          priority: a.priority ?? 1,
           thinkingEnabled: a.thinkingEnabled ?? true,
-          maxIterations: 0,
+          maxIterations: a.maxIterations ?? 0,
         })),
       },
     };

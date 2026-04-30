@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================
-#  NebChat Colab Setup — v3.0
+#  NebChat Colab Setup — v3.1
 #  Ollama + Agentic Search + Crawl4AI + Flask Bridge + ngrok
 #  Features: AI-powered web search, page reading, reasoning_effort
+#  Search: SearXNG + Wikipedia + DDG HTML + DDG library
+#  Content: Trafilatura + Jina Reader + Crawl4AI + BeautifulSoup
 #  Run this ENTIRE script in a single Colab cell.
 # ============================================================
 
@@ -35,10 +37,24 @@ def setup_system():
     except:
         os.system("pip install -q flask flask-cors pyngrok")
     try:
+        import trafilatura
+    except:
+        print("📄 Installing Trafilatura (primary content extractor)...")
+        os.system("pip install -q trafilatura")
+    try:
+        from bs4 import BeautifulSoup
+    except:
+        print("🍲 Installing BeautifulSoup4 (fallback HTML parser)...")
+        os.system("pip install -q beautifulsoup4")
+    try:
         from duckduckgo_search import DDGS
     except:
         print("🔍 Installing DuckDuckGo Search (fallback)...")
         os.system("pip install -q duckduckgo-search")
+    try:
+        import requests
+    except:
+        os.system("pip install -q requests")
     if shutil.which("ollama") is None:
         print("⬇️ Installing Ollama...")
         os.system("curl -fsSL https://ollama.com/install.sh | sh")
@@ -187,23 +203,38 @@ def write_bridge_file():
     return bridge_path
 
 BRIDGE_CODE = r'''#!/usr/bin/env python3
-# NebChat Agentic Bridge v3.0 — Flask application
+# NebChat Agentic Bridge v3.1 — Flask application
 # Supports: Ollama proxy, Agentic search/crawl, SSE keepalive
+# Search: SearXNG -> Wikipedia -> DDG HTML -> DDG library
+# Content: Trafilatura -> Jina Reader -> Crawl4AI -> BeautifulSoup
 
-import os, sys, time, json, traceback, threading, queue
+import os, sys, time, json, traceback, threading, queue, random, re
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 from flask import Flask, Response, request, jsonify, stream_with_context
 from flask_cors import CORS
+import requests as req_lib
 
 PORT_OLLAMA = int(os.environ.get("PORT_OLLAMA", 11434))
 PORT_CRAWL4AI = int(os.environ.get("PORT_CRAWL4AI", 8020))
 OLLAMA_BASE = f"http://localhost:{PORT_OLLAMA}"
 CRAWL4AI_BASE = f"http://localhost:{PORT_CRAWL4AI}"
-JINA_SEARCH_URL = "https://s.jina.ai/"
 JINA_READER_URL = "https://r.jina.ai/"
 KEEPALIVE_INTERVAL = 15
 AGENTIC_MAX_ROUNDS = 5
+
+# SearXNG public instances — shuffled for load distribution
+SEARXNG_INSTANCES = [
+    "https://searx.rhscz.eu",
+    "https://search.zina.dev",
+    "https://search.bladerunn.in",
+    "https://searx.be",
+    "https://search.bus-hit.me",
+    "https://searx.fmac.xyz",
+    "https://search.mdosch.de",
+    "https://searxng.ch",
+    "https://search.sapti.me",
+]
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -222,6 +253,32 @@ def _log_req():
     rid = _next_id()
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] #{rid:05d} {request.method} {request.path}", flush=True)
+
+# ==================== QUERY TYPE DETECTION ====================
+FACTUAL_PATTERNS = re.compile(
+    r'\b(who is|who was|what is|what are|what was|what were|define|definition|meaning of|'
+    r'explain|how does|how do|how did|history of|origin of|biography|born|died|'
+    r'capital of|population of|area of|founder of|inventor of|'
+    r'wikipedia|encyclopedia|overview|summary of)\b',
+    re.IGNORECASE
+)
+
+NEWS_PATTERNS = re.compile(
+    r'\b(latest|recent|current|today|this week|this month|this year|breaking|'
+    r'news|update|updated|just happened|live|now|price of|stock|'
+    r'score|result|weather|forecast|election|released|announced)\b',
+    re.IGNORECASE
+)
+
+def _detect_query_type(query):
+    """Detect whether a query is factual, news/real-time, or general.
+    Returns: 'factual', 'news', or 'general'
+    """
+    if NEWS_PATTERNS.search(query):
+        return "news"
+    if FACTUAL_PATTERNS.search(query):
+        return "factual"
+    return "general"
 
 # ==================== TOOL DEFINITIONS ====================
 AGENTIC_TOOLS = [
@@ -255,14 +312,172 @@ AGENTIC_TOOLS = [
     }
 ]
 
-# ==================== TOOL EXECUTION ====================
-def _tool_web_search(query):
-    """DuckDuckGo (primary) -> Jina Search -> Google HTML scraping fallback"""
-    # Primary: DuckDuckGo via library (free, unlimited, reliable)
+# ==================== SEARCH IMPLEMENTATIONS ====================
+
+def _search_searxng(query, max_results=10, categories="general"):
+    """SearXNG metasearch — aggregates Google + Bing + 250+ engines via public instances."""
+    instances = SEARXNG_INSTANCES[:]
+    random.shuffle(instances)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    for instance in instances:
+        try:
+            params = {
+                "q": query,
+                "format": "json",
+                "categories": categories,
+                "language": "en",
+            }
+            resp = req_lib.get(
+                f"{instance}/search",
+                params=params,
+                headers=headers,
+                timeout=10,
+                allow_redirects=True,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            results = []
+            for item in data.get("results", [])[:max_results]:
+                # SearXNG results can have different fields
+                title = item.get("title", "")
+                url = item.get("url", item.get("link", ""))
+                snippet = item.get("content", item.get("snippet", ""))
+                if not url:
+                    continue
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": (snippet or "")[:500],
+                })
+            if results:
+                print(f"[SEARCH] SearXNG hit from {instance} ({len(results)} results)", flush=True)
+                return results
+        except Exception as e:
+            print(f"[SEARCH] SearXNG {instance} failed: {e}", flush=True)
+            continue
+    return None
+
+def _search_wikipedia(query, max_results=5):
+    """Wikipedia API search — excellent for factual/encyclopedic queries."""
+    try:
+        # Step 1: Search for pages matching the query
+        search_params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srlimit": max_results,
+            "format": "json",
+            "utf8": 1,
+        }
+        resp = req_lib.get(
+            "https://en.wikipedia.org/w/api.php",
+            params=search_params,
+            timeout=10,
+            headers={"User-Agent": "NebChatBridge/3.1 (https://github.com/nebchat)"},
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        search_results = data.get("query", {}).get("search", [])
+        if not search_results:
+            return None
+
+        results = []
+        page_ids = [str(r["pageid"]) for r in search_results]
+
+        # Step 2: Get extracts (content snippets) for found pages
+        extract_params = {
+            "action": "query",
+            "prop": "extracts",
+            "exintro": True,
+            "explaintext": True,
+            "exsentences": 5,
+            "pageids": "|".join(page_ids),
+            "format": "json",
+            "utf8": 1,
+        }
+        extract_resp = req_lib.get(
+            "https://en.wikipedia.org/w/api.php",
+            params=extract_params,
+            timeout=10,
+            headers={"User-Agent": "NebChatBridge/3.1 (https://github.com/nebchat)"},
+        )
+        extracts = {}
+        if extract_resp.status_code == 200:
+            pages = extract_resp.json().get("query", {}).get("pages", {})
+            for pid, pdata in pages.items():
+                extracts[pid] = pdata.get("extract", "")
+
+        for item in search_results:
+            page_id = str(item["pageid"])
+            title = item.get("title", "")
+            url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+            snippet = extracts.get(page_id, item.get("snippet", ""))
+            # Clean HTML from snippet if present
+            snippet = re.sub(r'<[^>]+>', '', snippet)[:500]
+            results.append({
+                "title": f"{title} — Wikipedia",
+                "url": url,
+                "snippet": snippet,
+            })
+        if results:
+            print(f"[SEARCH] Wikipedia returned {len(results)} results", flush=True)
+        return results if results else None
+    except Exception as e:
+        print(f"[SEARCH] Wikipedia failed: {e}", flush=True)
+        return None
+
+def _search_ddg_html(query, max_results=8):
+    """DuckDuckGo HTML scraping — reliable fallback using BeautifulSoup."""
+    try:
+        from bs4 import BeautifulSoup
+        ddg_url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        data = {"q": query, "b": "", "kl": "us-en"}
+        resp = req_lib.post(ddg_url, data=data, headers=headers, timeout=10, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        for result_div in soup.find_all("div", class_="result"):
+            title_tag = result_div.find("a", class_="result__a")
+            snippet_tag = result_div.find("a", class_="result__snippet")
+            if not title_tag:
+                continue
+            title = title_tag.get_text(strip=True)
+            href = title_tag.get("href", "")
+            # DDG HTML uses redirect URLs — extract the real URL
+            if href and "uddg=" in href:
+                real_url = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [href])
+                href = real_url[0] if real_url else href
+            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+            if title and href:
+                results.append({
+                    "title": title,
+                    "url": href,
+                    "snippet": snippet[:500],
+                })
+            if len(results) >= max_results:
+                break
+        if results:
+            print(f"[SEARCH] DDG HTML returned {len(results)} results", flush=True)
+        return results if results else None
+    except Exception as e:
+        print(f"[SEARCH] DDG HTML failed: {e}", flush=True)
+        return None
+
+def _search_ddg_library(query, max_results=8):
+    """DuckDuckGo Search library — kept as final fallback."""
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
-            ddg_results = list(ddgs.text(query, max_results=8))
+            ddg_results = list(ddgs.text(query, max_results=max_results))
         if ddg_results:
             results = []
             for r in ddg_results:
@@ -271,81 +486,175 @@ def _tool_web_search(query):
                     "url": r.get("href", ""),
                     "snippet": r.get("body", "")[:500],
                 })
-            return json.dumps(results)
+            print(f"[SEARCH] DDG library returned {len(results)} results", flush=True)
+            return results
     except Exception as e:
-        print(f"[AGENTIC] DDG error: {e}", flush=True)
+        print(f"[SEARCH] DDG library failed: {e}", flush=True)
+    return None
 
-    # Fallback 1: Jina AI Search
+# ==================== CONTENT EXTRACTION IMPLEMENTATIONS ====================
+
+def _extract_trafilatura(url):
+    """Trafilatura — fast, high-quality content extraction from web pages."""
     try:
-        url = f"{JINA_SEARCH_URL}{urllib.parse.quote(query)}"
-        headers = {"Accept": "application/json", "X-No-Cache": "true"}
-        jina_key = os.environ.get("JINA_API_KEY", "")
-        if jina_key:
-            headers["Authorization"] = f"Bearer {jina_key}"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-        results = []
-        for item in data.get("data", [])[:8]:
-            results.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "snippet": (item.get("description") or item.get("content", ""))[:500],
-            })
-        if results:
-            return json.dumps(results)
+        import trafilatura
+        # Download the page
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return None
+        # Extract main content as markdown
+        content = trafilatura.extract(
+            downloaded,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            favor_precision=True,
+        )
+        if content and len(content.strip()) > 50:
+            print(f"[EXTRACT] Trafilatura extracted {len(content)} chars from {url}", flush=True)
+            return content[:5000]
     except Exception as e:
-        print(f"[AGENTIC] Jina error: {e}", flush=True)
+        print(f"[EXTRACT] Trafilatura failed: {e}", flush=True)
+    return None
 
-    # Fallback 2: Google HTML scraping (free, unlimited)
-    try:
-        google_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num=8"
-        req = urllib.request.Request(google_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-        import re
-        results = []
-        # Extract search result blocks from Google HTML
-        for match in re.finditer(r'<a href="/url\?q=(https?://[^&"]+)&[^"]*"[^>]*>(.*?)</a>', html):
-            url = urllib.parse.unquote(match.group(1))
-            title = re.sub(r'<[^>]+>', '', match.group(2)).strip()
-            if url and title and not url.startswith("https://www.google.com"):
-                # Try to get snippet from nearby text
-                snippet_match = re.search(re.escape(url) + r'.*?(?:<span[^>]*>|<div[^>]*>)(.*?)(?:</span>|</div>)', html[match.start():match.start()+2000])
-                snippet = re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip()[:300] if snippet_match else ""
-                results.append({"title": title, "url": url, "snippet": snippet})
-        if results:
-            return json.dumps(results[:8])
-    except Exception as e:
-        print(f"[AGENTIC] Google scraping error: {e}", flush=True)
-
-    return json.dumps({"error": "All search methods failed"})
-
-def _tool_read_page(url):
-    """Crawl4AI -> Jina Reader fallback"""
-    try:
-        import requests as req_lib
-        resp = req_lib.post(f"{CRAWL4AI_BASE}/crawl", json={"url": url}, timeout=30)
-        if resp.ok:
-            data = resp.json()
-            content = data.get("content", {}).get("markdown", "")
-            if content and len(content.strip()) > 50:
-                return content[:4000]
-    except:
-        pass
+def _extract_jina_reader(url):
+    """Jina Reader — good for JS-heavy sites that need server-side rendering."""
     try:
         jina_url = f"{JINA_READER_URL}{urllib.parse.quote(url, safe=':/?#[]@!$&()*+,;=')}"
         headers = {"Accept": "text/markdown"}
         jina_key = os.environ.get("JINA_API_KEY", "")
         if jina_key:
             headers["Authorization"] = f"Bearer {jina_key}"
-        req = urllib.request.Request(jina_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return resp.read().decode("utf-8", errors="replace")[:4000]
-    except:
-        return "Failed to read page content."
+        resp = req_lib.get(jina_url, headers=headers, timeout=20, allow_redirects=True)
+        content = resp.text
+        if content and len(content.strip()) > 50:
+            print(f"[EXTRACT] Jina Reader extracted {len(content)} chars from {url}", flush=True)
+            return content[:5000]
+    except Exception as e:
+        print(f"[EXTRACT] Jina Reader failed: {e}", flush=True)
+    return None
+
+def _extract_crawl4ai(url):
+    """Crawl4AI — browser-based extraction for dynamic pages."""
+    try:
+        resp = req_lib.post(f"{CRAWL4AI_BASE}/crawl", json={"url": url}, timeout=60)
+        if resp.ok:
+            data = resp.json()
+            content = ""
+            if isinstance(data, dict):
+                c = data.get("content", data.get("result", {}))
+                if isinstance(c, dict):
+                    content = c.get("markdown", c.get("raw_markdown", json.dumps(c)))
+                elif isinstance(c, str):
+                    content = c
+            if content and len(content.strip()) > 50:
+                print(f"[EXTRACT] Crawl4AI extracted {len(content)} chars from {url}", flush=True)
+                return content[:5000]
+    except Exception as e:
+        print(f"[EXTRACT] Crawl4AI failed: {e}", flush=True)
+    return None
+
+def _extract_beautifulsoup(url):
+    """BeautifulSoup fallback — basic HTML to text extraction."""
+    try:
+        from bs4 import BeautifulSoup
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        resp = req_lib.get(url, headers=headers, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Remove unwanted elements
+        for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]):
+            tag.decompose()
+        # Try to find main content area
+        main = soup.find("main") or soup.find("article") or soup.find("div", class_=re.compile(r"content|article|post|entry", re.I))
+        if main:
+            text = main.get_text(separator="\n", strip=True)
+        else:
+            text = soup.get_text(separator="\n", strip=True)
+        # Clean up excessive whitespace
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        text = "\n".join(lines)
+        if text and len(text) > 50:
+            print(f"[EXTRACT] BeautifulSoup extracted {len(text)} chars from {url}", flush=True)
+            return text[:5000]
+    except Exception as e:
+        print(f"[EXTRACT] BeautifulSoup failed: {e}", flush=True)
+    return None
+
+# ==================== UNIFIED TOOL EXECUTION ====================
+
+def _tool_web_search(query, max_results=10):
+    """Multi-layer search: SearXNG -> Wikipedia -> DDG HTML -> DDG library.
+    Automatically routes factual queries to Wikipedia first,
+    and news/real-time queries to SearXNG with categories=news.
+    """
+    query_type = _detect_query_type(query)
+    print(f"[AGENTIC] Search query type: {query_type} for: '{query[:80]}'", flush=True)
+
+    results = None
+
+    # For factual queries, try Wikipedia first (most reliable for facts)
+    if query_type == "factual":
+        results = _search_wikipedia(query, max_results=max_results)
+        if results:
+            return json.dumps(results)
+
+    # For news/real-time queries, use SearXNG with news category
+    if query_type == "news":
+        results = _search_searxng(query, max_results=max_results, categories="news")
+        if results:
+            return json.dumps(results)
+        # Fall through to general SearXNG
+
+    # Primary: SearXNG general search (aggregates Google + Bing + 250+ engines)
+    results = _search_searxng(query, max_results=max_results, categories="general")
+    if results:
+        return json.dumps(results)
+
+    # For factual queries that didn't get Wikipedia results, try it now as fallback
+    if query_type != "factual":
+        results = _search_wikipedia(query, max_results=max_results)
+        if results:
+            return json.dumps(results)
+
+    # Fallback: DDG HTML scraping
+    results = _search_ddg_html(query, max_results=max_results)
+    if results:
+        return json.dumps(results)
+
+    # Final fallback: DDG library
+    results = _search_ddg_library(query, max_results=max_results)
+    if results:
+        return json.dumps(results)
+
+    return json.dumps({"error": "All search methods failed"})
+
+def _tool_read_page(url):
+    """Multi-layer content extraction: Trafilatura -> Jina Reader -> Crawl4AI -> BeautifulSoup."""
+    # Primary: Trafilatura (fast, high quality)
+    content = _extract_trafilatura(url)
+    if content:
+        return content[:4000]
+
+    # Fallback 1: Jina Reader (good for JS-heavy sites)
+    content = _extract_jina_reader(url)
+    if content:
+        return content[:4000]
+
+    # Fallback 2: Crawl4AI (browser-based, handles dynamic pages)
+    content = _extract_crawl4ai(url)
+    if content:
+        return content[:4000]
+
+    # Fallback 3: BeautifulSoup (basic HTML parsing)
+    content = _extract_beautifulsoup(url)
+    if content:
+        return content[:4000]
+
+    return "Failed to read page content."
 
 def _execute_tool(name, args):
     if name == "web_search":
@@ -577,7 +886,7 @@ def _handle_agentic(body_json, should_stream):
 def index():
     return jsonify({
         "service": "NebChat Agentic Bridge",
-        "version": "3.0",
+        "version": "3.1",
         "agentic": True,
         "endpoints": {
             "GET /": "Status page",
@@ -585,8 +894,8 @@ def index():
             "POST /v1/chat/completions": "Chat (supports agentic mode with tools)",
             "* /v1/<path>": "Proxy to Ollama /v1/*",
             "* /api/<path>": "Proxy to Ollama /api/*",
-            "GET /search?q=...": "Search (Jina + DDG fallback)",
-            "POST /crawl": "Read page (Crawl4AI + Jina Reader fallback)",
+            "GET /search?q=...": "Search (SearXNG + Wikipedia + DDG fallback)",
+            "POST /crawl": "Read page (Trafilatura + Jina + Crawl4AI + BS4 fallback)",
             "GET /health": "Health check",
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -648,72 +957,59 @@ def search():
     if not query:
         return jsonify({"error": "Missing query parameter 'q'"}), 400
 
-    # Primary: DuckDuckGo (free, unlimited, reliable)
-    try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            ddg_results = list(ddgs.text(query, max_results=max_results))
-        if ddg_results:
-            results = []
-            for r in ddg_results:
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", r.get("link", "")),
-                    "description": r.get("body", r.get("snippet", "")),
-                    "content": r.get("body", ""),
-                })
-            return jsonify({"query": query, "source": "duckduckgo", "results": results})
-    except Exception as exc:
-        print(f"[SEARCH] DDG failed: {exc}", flush=True)
+    query_type = _detect_query_type(query)
+    source = "none"
+    results = None
 
-    # Fallback 1: Jina AI Search
-    try:
-        jina_url = f"{JINA_SEARCH_URL}{urllib.parse.quote(query)}"
-        jina_headers = {"Accept": "application/json", "X-Return-Format": "search", "X-No-Cache": "true"}
-        jina_key = os.environ.get("JINA_API_KEY", "")
-        if jina_key:
-            jina_headers["Authorization"] = f"Bearer {jina_key}"
-        req = urllib.request.Request(jina_url, headers=jina_headers, method="GET")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-        results = []
-        if isinstance(data, dict):
-            for item in data.get("data", [])[:max_results]:
-                results.append({
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "description": item.get("description", item.get("snippet", "")),
-                    "content": item.get("content", ""),
-                })
+    # For factual queries, try Wikipedia first
+    if query_type == "factual":
+        results = _search_wikipedia(query, max_results=max_results)
         if results:
-            return jsonify({"query": query, "source": "jina", "results": results})
-    except Exception as exc:
-        print(f"[SEARCH] Jina failed: {exc}", flush=True)
+            source = "wikipedia"
 
-    # Fallback 2: Google HTML scraping (free, unlimited)
-    try:
-        google_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num={max_results}"
-        req = urllib.request.Request(google_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-        import re as _re
-        results = []
-        for match in _re.finditer(r'<a href="/url\?q=(https?://[^&"]+)&[^"]*"[^>]*>(.*?)</a>', html):
-            url = urllib.parse.unquote(match.group(1))
-            title = _re.sub(r'<[^>]+>', '', match.group(2)).strip()
-            if url and title and not url.startswith("https://www.google.com"):
-                snippet_match = _re.search(_re.escape(url) + r'.*?(?:<span[^>]*>|<div[^>]*>)(.*?)(?:</span>|</div>)', html[match.start():match.start()+2000])
-                snippet = _re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip()[:300] if snippet_match else ""
-                results.append({"title": title, "url": url, "description": snippet, "content": snippet})
+    # For news queries, try SearXNG news category first
+    if not results and query_type == "news":
+        results = _search_searxng(query, max_results=max_results, categories="news")
         if results:
-            return jsonify({"query": query, "source": "google_scrape", "results": results[:max_results]})
-    except Exception as exc:
-        print(f"[SEARCH] Google scraping failed: {exc}", flush=True)
+            source = "searxng_news"
+
+    # General SearXNG search (primary for most queries)
+    if not results:
+        results = _search_searxng(query, max_results=max_results, categories="general")
+        if results:
+            source = "searxng"
+
+    # Wikipedia fallback (for non-factual queries that didn't try Wikipedia yet)
+    if not results and query_type != "factual":
+        results = _search_wikipedia(query, max_results=max_results)
+        if results:
+            source = "wikipedia"
+
+    # DDG HTML scraping fallback
+    if not results:
+        results = _search_ddg_html(query, max_results=max_results)
+        if results:
+            source = "ddg_html"
+
+    # DDG library fallback
+    if not results:
+        results = _search_ddg_library(query, max_results=max_results)
+        if results:
+            source = "ddg_library"
+
+    if results:
+        formatted = []
+        for r in results:
+            formatted.append({
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "description": r.get("snippet", r.get("description", "")),
+                "content": r.get("snippet", ""),
+            })
+        return jsonify({"query": query, "query_type": query_type, "source": source, "results": formatted})
 
     return jsonify({
-        "query": query, "source": "none", "results": [],
+        "query": query, "query_type": query_type, "source": "none", "results": [],
         "error": "All search methods failed",
     }), 502
 
@@ -724,45 +1020,29 @@ def crawl():
     if not url:
         return jsonify({"error": "Missing 'url' in request body"}), 400
 
-    # Crawl4AI
-    try:
-        import requests as req_lib
-        resp = req_lib.post(f"{CRAWL4AI_BASE}/crawl", json={"url": url}, timeout=60)
-        if resp.ok:
-            data = resp.json()
-            content = ""
-            if isinstance(data, dict):
-                c = data.get("content", data.get("result", {}))
-                if isinstance(c, dict):
-                    content = c.get("markdown", c.get("raw_markdown", json.dumps(c)))
-                elif isinstance(c, str):
-                    content = c
-            if data.get("success", False) or (content and len(content.strip()) > 50):
-                return jsonify({"url": url, "source": "crawl4ai", "content": {"markdown": content}, "success": True, "status_code": 200})
-    except Exception as exc:
-        print(f"[CRAWL] Crawl4AI failed: {exc}", flush=True)
+    # Primary: Trafilatura
+    content = _extract_trafilatura(url)
+    if content:
+        return jsonify({"url": url, "source": "trafilatura", "content": {"markdown": content}, "success": True, "status_code": 200})
 
-    # Jina Reader fallback
-    try:
-        jina_url = f"{JINA_READER_URL}{urllib.parse.quote(url, safe=':/?#[]@!$&()*+,;=')}"
-        jina_headers = {"Accept": "text/markdown"}
-        jina_key = os.environ.get("JINA_API_KEY", "")
-        if jina_key:
-            jina_headers["Authorization"] = f"Bearer {jina_key}"
-        req = urllib.request.Request(jina_url, headers=jina_headers, method="GET")
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            content = resp.read().decode("utf-8", errors="replace")
-        if content and len(content.strip()) > 20:
-            return jsonify({"url": url, "source": "jina_reader", "content": {"markdown": content[:5000]}, "success": True, "status_code": 200})
-    except Exception as exc:
-        return jsonify({
-            "url": url, "source": "none", "content": {"markdown": ""},
-            "success": False, "error": f"Crawl failed: {exc}",
-        }), 502
+    # Fallback 1: Jina Reader
+    content = _extract_jina_reader(url)
+    if content:
+        return jsonify({"url": url, "source": "jina_reader", "content": {"markdown": content}, "success": True, "status_code": 200})
+
+    # Fallback 2: Crawl4AI
+    content = _extract_crawl4ai(url)
+    if content:
+        return jsonify({"url": url, "source": "crawl4ai", "content": {"markdown": content}, "success": True, "status_code": 200})
+
+    # Fallback 3: BeautifulSoup
+    content = _extract_beautifulsoup(url)
+    if content:
+        return jsonify({"url": url, "source": "beautifulsoup", "content": {"markdown": content}, "success": True, "status_code": 200})
 
     return jsonify({
         "url": url, "source": "none", "content": {"markdown": ""},
-        "success": False, "error": "Both Crawl4AI and Jina Reader returned empty",
+        "success": False, "error": "All content extraction methods failed (Trafilatura, Jina Reader, Crawl4AI, BeautifulSoup)",
     }), 502
 
 @app.route("/health", methods=["GET"])
@@ -782,7 +1062,9 @@ def health():
         services["crawl4ai"] = {"status": "ok"}
     except:
         services["crawl4ai"] = {"status": "offline"}
-    services["jina_search"] = {"status": "available"}
+    services["searxng"] = {"status": "available", "instances": len(SEARXNG_INSTANCES)}
+    services["wikipedia"] = {"status": "available"}
+    services["trafilatura"] = {"status": "available"}
     services["agentic"] = {"status": "enabled"}
     return jsonify({"status": "ok", "services": services})
 
@@ -796,9 +1078,11 @@ def server_error(e):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  NebChat Agentic Bridge v3.0")
+    print("  NebChat Agentic Bridge v3.1")
     print(f"  Ollama:   {OLLAMA_BASE}")
     print(f"  Crawl4AI: {CRAWL4AI_BASE}")
+    print(f"  Search:   SearXNG ({len(SEARXNG_INSTANCES)} instances) + Wikipedia + DDG")
+    print(f"  Extract:  Trafilatura + Jina Reader + Crawl4AI + BS4")
     print(f"  Agentic:  Enabled (max {AGENTIC_MAX_ROUNDS} rounds)")
     print("=" * 60)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT_BRIDGE", 5000)), debug=False, threaded=True)
@@ -863,11 +1147,11 @@ def start_bridge_and_tunnel():
     print(f"\n📝 In NebChat Settings:")
     print(f"   1. Add Provider → Base URL: {BASE}")
     print(f"   2. Add Provider → API Key:  ollama")
-    print(f"   3. Add Search  → Type: DuckDuckGo → URL: {BASE}")
+    print(f"   3. Add Search  → Type: SearXNG → URL: {BASE}")
     print(f"   4. Page Reader URL:          {BASE}")
     print(f"\n🤖 Agentic Mode: AI can search & read web pages autonomously!")
     print(f"   Toggle Search ON in chat → AI decides when to search")
-    print(f"\n🔧 Routes: /v1/* → Ollama | /search → Jina+DDG | /crawl → Crawl4AI+Jina")
+    print(f"\n🔧 Routes: /v1/* → Ollama | /search → SearXNG+Wiki+DDG | /crawl → Trafilatura+Jina+Crawl4AI+BS4")
     print(f"💡 reasoning_effort: Send in chat request body (high/none)")
     print("=" * 60)
 

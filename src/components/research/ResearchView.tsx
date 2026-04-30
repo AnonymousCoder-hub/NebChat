@@ -1562,9 +1562,14 @@ export function ResearchView() {
       agents.map((a) => ({
         name: a.name,
         role: a.role,
+        systemPrompt: a.systemPrompt,
         modelId: a.modelId,
         providerId: a.providerId,
+        searchEnabled: a.searchEnabled,
+        searchLimit: a.searchLimit,
+        priority: a.priority,
         thinkingEnabled: a.thinkingEnabled,
+        maxIterations: a.maxIterations,
       })),
       maxSteps
     );
