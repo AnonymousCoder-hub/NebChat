@@ -291,8 +291,8 @@ export function HomeView() {
 
   // ---- Dashboard ----
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto max-w-6xl p-4 sm:p-6 lg:p-8 space-y-8">
+    <div className="flex-1 overflow-y-auto min-h-0">
+      <div className="mx-auto max-w-6xl p-3 sm:p-6 lg:p-8 space-y-6 sm:space-y-8">
         {/* ── Hero Section ────────────────────────────────────────── */}
         <motion.section
           initial={{ opacity: 0, y: -8 }}
@@ -462,7 +462,7 @@ export function HomeView() {
                   variants={container}
                   initial="hidden"
                   animate="show"
-                  className="grid gap-2.5 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+                  className="grid gap-2 sm:gap-2.5 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
                 >
                   {provider.models.map((model) => (
                     <ModelCard

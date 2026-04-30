@@ -449,20 +449,35 @@ export function AppSidebar() {
 // ─── SidebarToggle: floating button to reopen sidebar ────────────────────────
 
 export function SidebarToggle() {
-  const sidebarOpen = useAppStore((s) => s.sidebarOpen);
   const setSidebarOpen = useAppStore((s) => s.setSidebarOpen);
-
-  if (sidebarOpen) return null;
 
   return (
     <Button
       variant="outline"
       size="icon"
-      className="fixed top-3 left-3 z-40 h-8 w-8 bg-background/80 backdrop-blur-sm shadow-sm border-border/50 hover:bg-background"
+      className="h-8 w-8 bg-background/80 backdrop-blur-sm shadow-sm border-border/50 hover:bg-background shrink-0"
       onClick={() => setSidebarOpen(true)}
       aria-label="Open sidebar"
     >
       <PanelLeft className="h-4 w-4" />
+    </Button>
+  );
+}
+
+// ─── SettingsToggle: button to open settings dialog ──────────────────────────
+
+export function SettingsToggle() {
+  const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
+
+  return (
+    <Button
+      variant="outline"
+      size="icon"
+      className="h-8 w-8 bg-background/80 backdrop-blur-sm shadow-sm border-border/50 hover:bg-background shrink-0"
+      onClick={() => setSettingsOpen(true)}
+      aria-label="Open settings"
+    >
+      <Settings className="h-4 w-4" />
     </Button>
   );
 }

@@ -2,11 +2,13 @@
 
 import { useEffect } from "react";
 import { useAppStore } from "@/lib/store";
-import { AppSidebar, SidebarToggle } from "@/components/shared/AppSidebar";
+import { AppSidebar, SidebarToggle, SettingsToggle } from "@/components/shared/AppSidebar";
 import { HomeView } from "@/components/home/HomeView";
 import { ChatView } from "@/components/chat/ChatView";
 import { ResearchView } from "@/components/research/ResearchView";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { Button } from "@/components/ui/button";
+import { PanelLeft } from "lucide-react";
 
 export default function Page() {
   const initialize = useAppStore((s) => s.initialize);
@@ -33,17 +35,37 @@ export default function Page() {
 
       {/* Main content */}
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* Sidebar toggle (shown when sidebar is closed) */}
-        {!sidebarOpen && <SidebarToggle />}
+        {/* Mobile header with sidebar & settings toggles */}
+        <div className="shrink-0 md:hidden flex items-center justify-between px-3 py-2 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
+          {!sidebarOpen ? <SidebarToggle /> : <div className="w-8" />}
+          <div className="flex-1 text-center">
+            <span className="text-sm font-semibold text-foreground">NebChat</span>
+          </div>
+          {!settingsOpen ? <SettingsToggle /> : <div className="w-8" />}
+        </div>
 
-        <div className="flex-1 overflow-hidden">
-          <div className={activeView === "home" ? "" : "hidden h-full"}>
+        {/* Desktop floating sidebar toggle (shown when sidebar is closed) */}
+        {!sidebarOpen && (
+          <Button
+            variant="outline"
+            size="icon"
+            className="hidden md:flex fixed top-3 left-3 z-40 h-8 w-8 bg-background/80 backdrop-blur-sm shadow-sm border-border/50 hover:bg-background"
+            onClick={() => useAppStore.getState().setSidebarOpen(true)}
+            aria-label="Open sidebar"
+          >
+            <PanelLeft className="h-4 w-4" />
+          </Button>
+        )}
+
+        {/* View container — flex column so child views can expand properly */}
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+          <div className={`${activeView === "home" ? "flex-1 min-h-0 flex flex-col" : "hidden"}`}>
             <HomeView />
           </div>
-          <div className={activeView === "chat" ? "" : "hidden h-full"}>
+          <div className={`${activeView === "chat" ? "flex-1 min-h-0 flex flex-col" : "hidden"}`}>
             <ChatView />
           </div>
-          <div className={activeView === "research" ? "" : "hidden h-full"}>
+          <div className={`${activeView === "research" ? "flex-1 min-h-0 flex flex-col" : "hidden"}`}>
             <ResearchView />
           </div>
         </div>

@@ -55,6 +55,10 @@ import {
   Shield,
   ChevronDown,
   ChevronUp,
+  Bot,
+  Crown,
+  Brain,
+  Users,
 } from "lucide-react";
 import { useState, useCallback } from "react";
 import { toast } from "sonner";
@@ -436,14 +440,14 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl w-full h-dvh sm:h-[85vh] flex flex-col overflow-hidden p-0 gap-0">
+      <DialogContent className="sm:max-w-2xl w-full h-dvh sm:h-[85vh] flex flex-col overflow-hidden p-0 gap-0 max-w-full">
         {/* Header */}
-        <DialogHeader className="shrink-0 p-6 pb-4">
-          <DialogTitle className="flex items-center gap-2">
-            <Settings className="h-5 w-5" />
+        <DialogHeader className="shrink-0 p-3 sm:p-6 sm:pb-4 pb-2">
+          <DialogTitle className="flex items-center gap-2 text-base sm:text-lg">
+            <Settings className="h-4 w-4 sm:h-5 sm:w-5" />
             Settings
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="text-xs sm:text-sm">
             Manage your AI providers, search engines, and preferences. All data
             stays in your browser.
           </DialogDescription>
@@ -455,15 +459,19 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           onValueChange={setActiveTab}
           className="flex-1 flex flex-col min-h-0 overflow-hidden"
         >
-          <div className="shrink-0 px-6">
-            <TabsList className="w-full">
-              <TabsTrigger value="providers" className="flex-1 gap-1.5">
+          <div className="shrink-0 px-3 sm:px-6">
+            <TabsList className="w-full h-auto flex-wrap">
+              <TabsTrigger value="providers" className="flex-1 gap-1 text-xs sm:text-sm">
                 <Server className="h-3.5 w-3.5" />
-                AI Providers
+                <span className="hidden sm:inline">AI </span>Providers
               </TabsTrigger>
-              <TabsTrigger value="search" className="flex-1 gap-1.5">
+              <TabsTrigger value="search" className="flex-1 gap-1 text-xs sm:text-sm">
                 <Search className="h-3.5 w-3.5" />
                 Search
+              </TabsTrigger>
+              <TabsTrigger value="swarm" className="flex-1 gap-1 text-xs sm:text-sm">
+                <Zap className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Agentic </span>Swarm
               </TabsTrigger>
             </TabsList>
           </div>
@@ -476,9 +484,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
             className="flex-1 min-h-0 mt-0 overflow-hidden"
           >
             <ScrollArea className="h-full">
-              <div className="px-6 pb-6 space-y-6">
+              <div className="px-3 sm:px-6 pb-6 space-y-4 sm:space-y-6">
                 {/* Section header */}
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                   <div>
                     <h3 className="text-sm font-semibold">API Providers</h3>
                     <p className="text-xs text-muted-foreground">
@@ -488,7 +496,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   <Button
                     size="sm"
                     onClick={() => setShowForm(!showForm)}
-                    className="gap-1.5"
+                    className="gap-1.5 w-full sm:w-auto"
                   >
                     <Plus className="h-3.5 w-3.5" />
                     Add Provider
@@ -869,9 +877,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
             className="flex-1 min-h-0 mt-0 overflow-hidden"
           >
             <ScrollArea className="h-full">
-              <div className="px-6 pb-6 space-y-6">
+              <div className="px-3 sm:px-6 pb-6 space-y-4 sm:space-y-6">
                 {/* Section header */}
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                   <div>
                     <h3 className="text-sm font-semibold">Search Providers</h3>
                     <p className="text-xs text-muted-foreground">
@@ -881,7 +889,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   <Button
                     size="sm"
                     onClick={() => setShowSearchForm(!showSearchForm)}
-                    className="gap-1.5"
+                    className="gap-1.5 w-full sm:w-auto"
                   >
                     <Plus className="h-3.5 w-3.5" />
                     Add Search
@@ -1347,6 +1355,199 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     </ul>
                   </div>
                 </div>
+              </div>
+            </ScrollArea>
+          </TabsContent>
+          {/* ============================================================ */}
+          {/* SWARM TAB                                                    */}
+          {/* ============================================================ */}
+          <TabsContent value="swarm" className="flex-1 min-h-0 mt-0 overflow-hidden">
+            <ScrollArea className="h-full">
+              <div className="px-3 sm:px-6 pb-6 space-y-4 sm:space-y-6">
+                {/* Section header */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold">Agentic Swarm</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Automated multi-agent research with user-in-the-loop control
+                    </p>
+                  </div>
+                  <Badge
+                    variant="outline"
+                    className="text-[10px] px-2 py-0.5 h-5 border-violet-400/40 text-violet-600 dark:text-violet-400 self-start sm:self-auto"
+                  >
+                    <Zap className="h-3 w-3 mr-1" />
+                    New
+                  </Badge>
+                </div>
+
+                {/* ---------- How it Works ---------- */}
+                <div className="rounded-lg bg-violet-50 dark:bg-violet-950/20 border border-violet-200/50 dark:border-violet-800/30 p-4 space-y-3">
+                  <h4 className="text-xs font-semibold text-violet-700 dark:text-violet-300 flex items-center gap-1.5">
+                    <Brain className="h-3.5 w-3.5" /> How it Works
+                  </h4>
+                  <p className="text-[11px] text-violet-600/80 dark:text-violet-400/80 leading-relaxed">
+                    The Agentic Swarm is a team of AI agents that work together to
+                    research, analyze, and synthesize information — while keeping
+                    you in the loop every step of the way.
+                  </p>
+                  <ul className="space-y-2">
+                    <li className="flex items-start gap-2 text-[11px] text-violet-700 dark:text-violet-300">
+                      <Crown className="h-3.5 w-3.5 mt-0.5 shrink-0 text-amber-500" />
+                      <span>
+                        <strong>Manager agent</strong> coordinates the team and talks
+                        directly to you
+                      </span>
+                    </li>
+                    <li className="flex items-start gap-2 text-[11px] text-violet-700 dark:text-violet-300">
+                      <Search className="h-3.5 w-3.5 mt-0.5 shrink-0 text-blue-500" />
+                      <span>
+                        <strong>Research agents</strong> search the web and read pages
+                        autonomously
+                      </span>
+                    </li>
+                    <li className="flex items-start gap-2 text-[11px] text-violet-700 dark:text-violet-300">
+                      <Users className="h-3.5 w-3.5 mt-0.5 shrink-0 text-emerald-500" />
+                      <span>
+                        The swarm <strong>pauses when it needs your input</strong>{" "}
+                        (user-in-the-loop)
+                      </span>
+                    </li>
+                    <li className="flex items-start gap-2 text-[11px] text-violet-700 dark:text-violet-300">
+                      <Shield className="h-3.5 w-3.5 mt-0.5 shrink-0 text-red-400" />
+                      <span>
+                        You have <strong>full control</strong> to stop or restart at any
+                        time
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+
+                {/* ---------- Quick Start ---------- */}
+                <div className="space-y-3">
+                  <h4 className="text-xs font-semibold flex items-center gap-1.5">
+                    <Zap className="h-3.5 w-3.5 text-amber-500" /> Quick Start
+                  </h4>
+                  <div className="rounded-lg border bg-card p-4 space-y-2.5">
+                    <ul className="space-y-2">
+                      <li className="flex items-start gap-2 text-[11px] text-muted-foreground">
+                        <span className="flex items-center justify-center h-4 w-4 rounded-full bg-emerald-100 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 text-[9px] font-bold shrink-0">
+                          1
+                        </span>
+                        Open the sidebar and tap &quot;Agentic Swarm&quot; to start
+                      </li>
+                      <li className="flex items-start gap-2 text-[11px] text-muted-foreground">
+                        <span className="flex items-center justify-center h-4 w-4 rounded-full bg-emerald-100 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 text-[9px] font-bold shrink-0">
+                          2
+                        </span>
+                        Or create a swarm from the home screen
+                      </li>
+                      <li className="flex items-start gap-2 text-[11px] text-muted-foreground">
+                        <span className="flex items-center justify-center h-4 w-4 rounded-full bg-emerald-100 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 text-[9px] font-bold shrink-0">
+                          3
+                        </span>
+                        Configure your agents with roles, models, and tools
+                      </li>
+                      <li className="flex items-start gap-2 text-[11px] text-muted-foreground">
+                        <span className="flex items-center justify-center h-4 w-4 rounded-full bg-emerald-100 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 text-[9px] font-bold shrink-0">
+                          4
+                        </span>
+                        The Manager will chat with you to understand your needs
+                      </li>
+                      <li className="flex items-start gap-2 text-[11px] text-muted-foreground">
+                        <span className="flex items-center justify-center h-4 w-4 rounded-full bg-emerald-100 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 text-[9px] font-bold shrink-0">
+                          5
+                        </span>
+                        Watch the activity feed in real-time
+                      </li>
+                      <li className="flex items-start gap-2 text-[11px] text-muted-foreground">
+                        <span className="flex items-center justify-center h-4 w-4 rounded-full bg-emerald-100 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 text-[9px] font-bold shrink-0">
+                          6
+                        </span>
+                        Respond when the swarm asks for your input
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+
+                {/* ---------- Swarm Capabilities ---------- */}
+                <div className="space-y-3">
+                  <h4 className="text-xs font-semibold flex items-center gap-1.5">
+                    <Bot className="h-3.5 w-3.5 text-blue-500" /> Swarm Capabilities
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {/* CHAT */}
+                    <div className="flex items-center gap-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200/50 dark:border-emerald-800/30 p-2.5">
+                      <Badge className="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border-emerald-300/50 dark:border-emerald-700/50 text-[9px] px-1.5 py-0 h-4 font-mono hover:bg-emerald-100">
+                        CHAT
+                      </Badge>
+                      <span className="text-[11px] text-emerald-700 dark:text-emerald-300">
+                        User-in-the-loop — swarm pauses for your input
+                      </span>
+                    </div>
+                    {/* SEARCH */}
+                    <div className="flex items-center gap-2.5 rounded-lg bg-blue-50 dark:bg-blue-950/20 border border-blue-200/50 dark:border-blue-800/30 p-2.5">
+                      <Badge className="bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 border-blue-300/50 dark:border-blue-700/50 text-[9px] px-1.5 py-0 h-4 font-mono hover:bg-blue-100">
+                        SEARCH
+                      </Badge>
+                      <span className="text-[11px] text-blue-700 dark:text-blue-300">
+                        Web search — agents search the web autonomously
+                      </span>
+                    </div>
+                    {/* READ */}
+                    <div className="flex items-center gap-2.5 rounded-lg bg-cyan-50 dark:bg-cyan-950/20 border border-cyan-200/50 dark:border-cyan-800/30 p-2.5">
+                      <Badge className="bg-cyan-100 dark:bg-cyan-900/40 text-cyan-700 dark:text-cyan-300 border-cyan-300/50 dark:border-cyan-700/50 text-[9px] px-1.5 py-0 h-4 font-mono hover:bg-cyan-100">
+                        READ
+                      </Badge>
+                      <span className="text-[11px] text-cyan-700 dark:text-cyan-300">
+                        Page reading — agents read and extract content from URLs
+                      </span>
+                    </div>
+                    {/* DELEGATE */}
+                    <div className="flex items-center gap-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200/50 dark:border-amber-800/30 p-2.5">
+                      <Badge className="bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border-amber-300/50 dark:border-amber-700/50 text-[9px] px-1.5 py-0 h-4 font-mono hover:bg-amber-100">
+                        DELEGATE
+                      </Badge>
+                      <span className="text-[11px] text-amber-700 dark:text-amber-300">
+                        Task delegation — manager assigns tasks to team members
+                      </span>
+                    </div>
+                    {/* SYNTHESIZE */}
+                    <div className="flex items-center gap-2.5 rounded-lg bg-violet-50 dark:bg-violet-950/20 border border-violet-200/50 dark:border-violet-800/30 p-2.5">
+                      <Badge className="bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300 border-violet-300/50 dark:border-violet-700/50 text-[9px] px-1.5 py-0 h-4 font-mono hover:bg-violet-100">
+                        SYNTHESIZE
+                      </Badge>
+                      <span className="text-[11px] text-violet-700 dark:text-violet-300">
+                        Knowledge synthesis — findings are combined
+                      </span>
+                    </div>
+                    {/* TODO */}
+                    <div className="flex items-center gap-2.5 rounded-lg bg-rose-50 dark:bg-rose-950/20 border border-rose-200/50 dark:border-rose-800/30 p-2.5">
+                      <Badge className="bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 border-rose-300/50 dark:border-rose-700/50 text-[9px] px-1.5 py-0 h-4 font-mono hover:bg-rose-100">
+                        TODO
+                      </Badge>
+                      <span className="text-[11px] text-rose-700 dark:text-rose-300">
+                        Task tracking — progress is tracked with todo lists
+                      </span>
+                    </div>
+                    {/* FINAL */}
+                    <div className="flex items-center gap-2.5 rounded-lg bg-indigo-50 dark:bg-indigo-950/20 border border-indigo-200/50 dark:border-indigo-800/30 p-2.5 sm:col-span-2">
+                      <Badge className="bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 border-indigo-300/50 dark:border-indigo-700/50 text-[9px] px-1.5 py-0 h-4 font-mono hover:bg-indigo-100">
+                        FINAL
+                      </Badge>
+                      <span className="text-[11px] text-indigo-700 dark:text-indigo-300">
+                        Final report — comprehensive answer delivered
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <Separator />
+
+                <p className="text-[10px] text-muted-foreground/60 text-center">
+                  Agentic Swarm runs entirely in your browser session. No data is sent
+                  to external services beyond your configured AI providers.
+                </p>
               </div>
             </ScrollArea>
           </TabsContent>
