@@ -92,6 +92,12 @@
   50% { opacity: 0.2; }
 }
 
+/* Shimmer animation for agentic activity box — like ChatGPT */
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
 .streaming-cursor::after {
   content: "▎";
   animation: cursor-breathe 1s ease-in-out infinite;

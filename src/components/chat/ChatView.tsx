@@ -65,6 +65,16 @@ function stripSearchTags(text: string): string {
   return text.replace(/\[SEARCH:\s*.+?\]/gi, "").trim();
 }
 
+// Agentic activity event from the bridge (real-time search/crawl tracking)
+export interface AgenticActivity {
+  type: "search" | "search_result" | "read" | "read_result";
+  query?: string;
+  url?: string;
+  count?: number;
+  chars?: number;
+  round?: number;
+}
+
 // Generate search query variations for comprehensive coverage
 function generateSearchVariations(query: string): string[] {
   const variations = [query];
@@ -81,6 +91,129 @@ function generateSearchVariations(query: string): string[] {
     variations.push(`${query} reddit discussion`);
   }
   return variations.slice(0, 3);
+}
+
+// ============================================================
+// Agentic Activity Box — sleek ChatGPT-style search/crawl indicator
+// Shows what the AI is searching for, reading, and finding in real-time
+// ============================================================
+function AgenticActivityBox({ activities, isLive }: { activities: AgenticActivity[]; isLive: boolean }) {
+  const lastActivity = activities[activities.length - 1];
+  const searchCount = activities.filter((a) => a.type === "search").length;
+  const readCount = activities.filter((a) => a.type === "read").length;
+  const totalResults = activities
+    .filter((a) => a.type === "search_result")
+    .reduce((sum, a) => sum + (a.count || 0), 0);
+
+  // Current status text
+  let statusText = "";
+  let StatusIcon = Search;
+  if (lastActivity?.type === "search") {
+    statusText = `Searching for "${lastActivity.query}"`;
+    StatusIcon = Search;
+  } else if (lastActivity?.type === "search_result") {
+    statusText = `Found ${lastActivity.count} results`;
+    StatusIcon = Globe;
+  } else if (lastActivity?.type === "read") {
+    const domain = lastActivity.url ? (() => { try { return new URL(lastActivity.url).hostname.replace("www.", ""); } catch { return "page"; } })() : "page";
+    statusText = `Reading ${domain}`;
+    StatusIcon = ExternalLink;
+  } else if (lastActivity?.type === "read_result") {
+    statusText = `Extracted ${(lastActivity.chars || 0).toLocaleString()} chars`;
+    StatusIcon = Globe;
+  }
+
+  return (
+    <div className="mx-auto max-w-3xl w-full px-2">
+      <div className="relative overflow-hidden rounded-2xl border bg-gradient-to-r from-violet-50/80 via-fuchsia-50/60 to-purple-50/80 dark:from-violet-950/30 dark:via-fuchsia-950/20 dark:to-purple-950/30 border-violet-200/50 dark:border-violet-800/30">
+        {/* Shimmer animation — like ChatGPT */}
+        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 dark:via-white/5 to-transparent animate-[shimmer_2.5s_ease-in-out_infinite]" />
+
+        <div className="relative p-3.5 space-y-2.5">
+          {/* Header: current status with animated icon */}
+          <div className="flex items-center gap-2.5">
+            <div className={`flex items-center justify-center h-7 w-7 rounded-full ${isLive ? "bg-gradient-to-br from-violet-500 to-fuchsia-500" : "bg-violet-200 dark:bg-violet-800"}`}>
+              <StatusIcon className={`h-3.5 w-3.5 text-white ${isLive ? "animate-pulse" : ""}`} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className={`text-sm font-medium truncate ${isLive ? "bg-gradient-to-r from-violet-600 to-fuchsia-600 dark:from-violet-400 dark:to-fuchsia-400 bg-clip-text text-transparent" : "text-muted-foreground"}`}>
+                {isLive ? statusText : `Done — ${searchCount} search${searchCount !== 1 ? "es" : ""}, ${readCount} page${readCount !== 1 ? "s" : ""} read`}
+              </p>
+              {isLive && (
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  Step {lastActivity?.round || 1} of agentic research
+                </p>
+              )}
+            </div>
+            {isLive && (
+              <div className="flex items-center gap-1">
+                <div className="h-1.5 w-1.5 rounded-full bg-violet-500 animate-bounce [animation-delay:0ms]" />
+                <div className="h-1.5 w-1.5 rounded-full bg-fuchsia-500 animate-bounce [animation-delay:150ms]" />
+                <div className="h-1.5 w-1.5 rounded-full bg-purple-500 animate-bounce [animation-delay:300ms]" />
+              </div>
+            )}
+          </div>
+
+          {/* Activity timeline — compact list of what happened */}
+          {activities.length > 1 && (
+            <div className="space-y-1 pl-2 border-l-2 border-violet-200/50 dark:border-violet-800/30 ml-3.5">
+              {activities.map((activity, i) => {
+                if (activity.type === "search") {
+                  return (
+                    <div key={i} className="flex items-center gap-2 text-xs text-muted-foreground py-0.5">
+                      <Search className="h-3 w-3 text-violet-500 shrink-0" />
+                      <span className="truncate">&quot;{activity.query}&quot;</span>
+                    </div>
+                  );
+                }
+                if (activity.type === "search_result") {
+                  return (
+                    <div key={i} className="flex items-center gap-2 text-xs text-muted-foreground py-0.5">
+                      <Globe className="h-3 w-3 text-emerald-500 shrink-0" />
+                      <span>{activity.count} results found</span>
+                    </div>
+                  );
+                }
+                if (activity.type === "read") {
+                  const domain = activity.url ? (() => { try { return new URL(activity.url).hostname.replace("www.", ""); } catch { return activity.url?.slice(0, 30); } })() : "page";
+                  return (
+                    <div key={i} className="flex items-center gap-2 text-xs text-muted-foreground py-0.5">
+                      <ExternalLink className="h-3 w-3 text-fuchsia-500 shrink-0" />
+                      <span className="truncate">{domain}</span>
+                    </div>
+                  );
+                }
+                if (activity.type === "read_result") {
+                  return (
+                    <div key={i} className="flex items-center gap-2 text-xs text-muted-foreground py-0.5">
+                      <Globe className="h-3 w-3 text-blue-500 shrink-0" />
+                      <span>{(activity.chars || 0).toLocaleString()} chars extracted</span>
+                    </div>
+                  );
+                }
+                return null;
+              })}
+            </div>
+          )}
+
+          {/* Summary stats */}
+          {totalResults > 0 && (
+            <div className="flex items-center gap-3 text-[10px] text-muted-foreground pt-1">
+              <span className="flex items-center gap-1">
+                <Search className="h-2.5 w-2.5" /> {searchCount} search{searchCount !== 1 ? "es" : ""}
+              </span>
+              <span className="flex items-center gap-1">
+                <ExternalLink className="h-2.5 w-2.5" /> {readCount} page{readCount !== 1 ? "s" : ""}
+              </span>
+              <span className="flex items-center gap-1">
+                <Globe className="h-2.5 w-2.5" /> {totalResults} results
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ============================================================
@@ -124,6 +257,10 @@ export function ChatView() {
   const [streamingMsgId, setStreamingMsgId] = useState("");
   // True while the smooth typing animation is running (during SSE + catch-up after stream ends)
   const [isRevealingActive, setIsRevealingActive] = useState(false);
+
+  // Agentic activity tracking — shows real-time search/crawl activity
+  const [agenticActivities, setAgenticActivities] = useState<AgenticActivity[]>([]);
+  const agenticActivitiesRef = useRef<AgenticActivity[]>([]);
 
   // Ref-based streaming state (avoids stale closures in async callbacks)
   const sessionRef = useRef<StreamSession>({
@@ -452,6 +589,16 @@ export function ChatView() {
                 session.content += contentDelta;
                 session.tokenTimestamps.push(Date.now());
               }
+
+              // Handle agentic activity events (search/crawl tracking)
+              const activity = delta.agentic_activity;
+              if (activity) {
+                agenticActivitiesRef.current = [
+                  ...agenticActivitiesRef.current,
+                  activity as AgenticActivity,
+                ];
+                setAgenticActivities([...agenticActivitiesRef.current]);
+              }
             } catch {
               // Skip malformed JSON
             }
@@ -695,6 +842,8 @@ export function ChatView() {
       setStreamingTps(0);
       setStreamingMsgId(assistantMessageId);
       setIsRevealingActive(true);
+      agenticActivitiesRef.current = [];
+      setAgenticActivities([]);
 
       // Build message history (limit to last 20 to prevent context overflow)
       const conv = useAppStore.getState().conversations.find(
@@ -1002,8 +1151,13 @@ export function ChatView() {
             );
           })}
 
-          {/* Searching indicator */}
-          {searchingNow && (
+          {/* Agentic Activity Display — sleek ChatGPT-style search/crawl indicator */}
+          {agenticActivities.length > 0 && (streamingActive || isRevealingActive) && (
+            <AgenticActivityBox activities={agenticActivities} isLive={streamingActive} />
+          )}
+
+          {/* Searching indicator (legacy — for non-agentic search) */}
+          {searchingNow && agenticActivities.length === 0 && (
             <div className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-emerald-50/50 dark:bg-emerald-950/20 border border-emerald-200/40 dark:border-emerald-800/30">
               <Loader2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400 animate-spin" />
               <span className="text-sm text-emerald-700 dark:text-emerald-300">

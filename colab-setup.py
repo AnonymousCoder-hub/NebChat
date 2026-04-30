@@ -227,7 +227,7 @@ OLLAMA_BASE = f"http://localhost:{PORT_OLLAMA}"
 CRAWL4AI_BASE = f"http://localhost:{PORT_CRAWL4AI}"
 JINA_READER_URL = "https://r.jina.ai/"
 KEEPALIVE_INTERVAL = 15
-AGENTIC_MAX_ROUNDS = 5
+AGENTIC_MAX_ROUNDS = 10  # More rounds = agent can search → read → search again → form answer
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -288,15 +288,29 @@ def _pw_search_bing(query, max_results=10):
     if not browser:
         return None
     try:
+        # Fresh context per search to avoid session/captcha issues
         context = browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport={'width': 1280, 'height': 720}
+            viewport={'width': 1280, 'height': 720},
+            locale='en-US',
         )
         page = context.new_page()
         try:
             encoded_q = urllib.parse.quote(query, safe='')
-            page.goto(f'https://www.bing.com/search?q={encoded_q}&count={max_results}', timeout=15000, wait_until='domcontentloaded')
-            page.wait_for_timeout(1500)
+            # Force English results with setlang and cc params
+            page.goto(f'https://www.bing.com/search?q={encoded_q}&count={max_results}&setlang=en&cc=US', timeout=15000, wait_until='domcontentloaded')
+            page.wait_for_timeout(2000)
+
+            # Check for captcha/challenge page
+            is_blocked = page.evaluate('''() => {
+                const body = document.body.innerText || '';
+                return body.includes('solve the challenge') || body.includes('captcha') ||
+                       body.includes('verify you are human') || body.includes('Are you human');
+            }''')
+            if is_blocked:
+                print(f"[SEARCH] Playwright/Bing got CAPTCHA, falling back", flush=True)
+                context.close()
+                return None
 
             results = page.evaluate('''(maxResults) => {
                 const items = [];
@@ -307,12 +321,6 @@ def _pw_search_bing(query, max_results=10):
                     const snippetEl = li.querySelector('.b_caption p, .b_lineclamp2, p');
                     if (titleEl) {
                         let url = titleEl.href || '';
-                        // Clean Bing redirect URLs
-                        if (url.includes('bing.com/ck/')) {
-                            // Try to extract from data attribs
-                            const realUrl = titleEl.getAttribute('href');
-                            url = realUrl || url;
-                        }
                         items.push({
                             title: titleEl.textContent?.trim() || '',
                             url: url,
@@ -325,13 +333,7 @@ def _pw_search_bing(query, max_results=10):
 
             context.close()
             if results:
-                # Clean up Bing redirect URLs
                 for r in results:
-                    url = r.get('url', '')
-                    if 'bing.com/ck/' in url or url.startswith('/'):
-                        # These are redirect URLs, try to keep them anyway
-                        # They still work as clickable links
-                        pass
                     r['snippet'] = (r.get('snippet', '') or '')[:500]
                 print(f"[SEARCH] Playwright/Bing returned {len(results)} results", flush=True)
                 return results
@@ -884,7 +886,9 @@ CRITICAL RULES:
 7. When you read a page, extract the key facts and data — don't just summarize the page structure."""
 
 def _handle_agentic(body_json, should_stream):
-    """Agentic loop: AI decides when to search/read, executes tools, returns final answer."""
+    """Agentic loop: AI decides when to search/read, executes tools, returns final answer.
+    Streams agentic activity (search queries, page reads) in real-time as SSE events.
+    """
     messages = list(body_json.get("messages", []))
     model = body_json.get("model", "qwen3:8b")
 
@@ -900,49 +904,189 @@ def _handle_agentic(body_json, should_stream):
     body_json["tools"] = AGENTIC_TOOLS
     body_json["tool_choice"] = "auto"
 
-    response_data = None
-
-    for round_num in range(AGENTIC_MAX_ROUNDS):
-        body_json["messages"] = messages
-        try:
-            response_data = _ollama_call(body_json)
-        except Exception as e:
-            return jsonify({"error": f"Ollama error: {e}"}), 502
-
-        choice = response_data.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        tool_calls = message.get("tool_calls", [])
-
-        if not tool_calls:
-            break
-
-        messages.append(message)
-        for tc in tool_calls:
-            func = tc.get("function", {})
-            name = func.get("name", "")
-            args = json.loads(func.get("arguments", "{}"))
-            tc_id = tc.get("id", "")
-
-            print(f"[AGENTIC] Round {round_num+1}: {name}({json.dumps(args)[:100]})", flush=True)
-            result = _execute_tool(name, args)
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": result,
-            })
-
-    if response_data is None:
-        return jsonify({"error": "No response from Ollama"}), 502
-
-    final_message = response_data.get("choices", [{}])[0].get("message", {})
-    final_content = final_message.get("content", "")
-    final_thinking = final_message.get("reasoning_content", final_message.get("thinking", ""))
-
-    if should_stream:
-        return _simulated_stream(final_content, final_thinking, model)
-    else:
+    if not should_stream:
+        # Non-streaming: run the full loop, return JSON
+        response_data = None
+        for round_num in range(AGENTIC_MAX_ROUNDS):
+            body_json["messages"] = messages
+            try:
+                response_data = _ollama_call(body_json)
+            except Exception as e:
+                return jsonify({"error": f"Ollama error: {e}"}), 502
+            choice = response_data.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            tool_calls = message.get("tool_calls", [])
+            if not tool_calls:
+                break
+            messages.append(message)
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = json.loads(func.get("arguments", "{}"))
+                tc_id = tc.get("id", "")
+                result = _execute_tool(name, args)
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
+        if response_data is None:
+            return jsonify({"error": "No response from Ollama"}), 502
         return jsonify(response_data)
+
+    # Streaming: run the agentic loop and stream activity + final answer in real-time
+    def generate():
+        chunk_id = f"chatcmpl-{int(time.time()*1000)}"
+        ts = int(time.time())
+
+        response_data = None
+        for round_num in range(AGENTIC_MAX_ROUNDS):
+            body_json["messages"] = messages
+            try:
+                response_data = _ollama_call(body_json)
+            except Exception as e:
+                err_data = {
+                    "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": f"\n\n⚠️ Error: {e}"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(err_data)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            choice = response_data.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            tool_calls = message.get("tool_calls", [])
+
+            if not tool_calls:
+                break  # Final answer — no more tool calls
+
+            # Process each tool call and stream activity
+            messages.append(message)
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = json.loads(func.get("arguments", "{}"))
+                tc_id = tc.get("id", "")
+
+                print(f"[AGENTIC] Round {round_num+1}: {name}({json.dumps(args)[:100]})", flush=True)
+
+                # Stream an agentic activity event so the UI can show what's happening
+                if name == "web_search":
+                    search_query = args.get("query", "")
+                    activity = {
+                        "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                        "choices": [{"index": 0, "delta": {
+                            "content": "",
+                            "agentic_activity": {
+                                "type": "search",
+                                "query": search_query,
+                                "round": round_num + 1,
+                            }
+                        }, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(activity)}\n\n"
+                elif name == "read_page":
+                    page_url = args.get("url", "")
+                    activity = {
+                        "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                        "choices": [{"index": 0, "delta": {
+                            "content": "",
+                            "agentic_activity": {
+                                "type": "read",
+                                "url": page_url,
+                                "round": round_num + 1,
+                            }
+                        }, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(activity)}\n\n"
+
+                # Execute the tool
+                result = _execute_tool(name, args)
+
+                # Stream a "found results" activity
+                if name == "web_search":
+                    try:
+                        parsed = json.loads(result)
+                        count = len(parsed) if isinstance(parsed, list) else 0
+                        activity = {
+                            "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                            "choices": [{"index": 0, "delta": {
+                                "content": "",
+                                "agentic_activity": {
+                                    "type": "search_result",
+                                    "count": count,
+                                    "round": round_num + 1,
+                                }
+                            }, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(activity)}\n\n"
+                    except:
+                        pass
+                elif name == "read_page":
+                    content_len = len(result) if result else 0
+                    activity = {
+                        "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                        "choices": [{"index": 0, "delta": {
+                            "content": "",
+                            "agentic_activity": {
+                                "type": "read_result",
+                                "chars": content_len,
+                                "round": round_num + 1,
+                            }
+                        }, "finish_reason": None}],
+                        }
+                    yield f"data: {json.dumps(activity)}\n\n"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": result,
+                })
+
+        if response_data is None:
+            err_data = {
+                "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                "choices": [{"index": 0, "delta": {"content": "No response from AI."}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(err_data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Stream the final answer
+        final_message = response_data.get("choices", [{}])[0].get("message", {})
+        final_content = final_message.get("content", "")
+        final_thinking = final_message.get("reasoning_content", final_message.get("thinking", ""))
+
+        # Send thinking content first
+        if final_thinking:
+            for i in range(0, len(final_thinking), 12):
+                data = {
+                    "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": final_thinking[i:i+12]}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+
+        # Send content in small chunks for smooth display
+        for i in range(0, len(final_content), 8):
+            delta = {}
+            if i == 0:
+                delta["role"] = "assistant"
+            delta["content"] = final_content[i:i+8]
+            data = {
+                "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+
+        # Done
+        data = {
+            "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(data)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 # ==================== ROUTES ====================
 @app.route("/")

@@ -34,6 +34,14 @@ export interface Message {
   searchQueries?: string[];
   tokenStats?: TokenStats;
   isStreaming?: boolean;
+  agenticActivities?: {
+    type: "search" | "search_result" | "read" | "read_result";
+    query?: string;
+    url?: string;
+    count?: number;
+    chars?: number;
+    round?: number;
+  }[];
 }
 
 export interface Conversation {
