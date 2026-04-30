@@ -1071,13 +1071,18 @@ export function ResearchView() {
   // Load existing swarm
   useEffect(() => {
     if (activeSwarmConversation) {
+      // When research is actively running, agents are already correctly set in
+      // memory — skip overwriting them from the store to avoid resetting
+      // toggles like searchEnabled (race condition on new conversation ID).
+      const loadAgents = !isRunningRef.current;
+
       // Use flushSync-free approach to batch state updates from external data
       const stateUpdates = () => {
         setTopic(activeSwarmConversation.swarmConfig?.topic || "");
         setMaxSteps(activeSwarmConversation.swarmConfig?.maxSteps ?? 0);
         setFinalOutput(activeSwarmConversation.swarmOutput || "");
         setActiveTab(activeSwarmConversation.swarmOutput ? "output" : "activity");
-        if (activeSwarmConversation.swarmConfig?.agents)
+        if (loadAgents && activeSwarmConversation.swarmConfig?.agents)
           setAgents(activeSwarmConversation.swarmConfig.agents);
         if (activeSwarmConversation.swarmSteps?.length)
           setSteps(activeSwarmConversation.swarmSteps);

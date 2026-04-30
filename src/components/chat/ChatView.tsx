@@ -162,7 +162,7 @@ export function ChatView() {
   // we advance a "display position" by a few chars per frame, creating a smooth
   // typing animation even when SSE data arrives in large chunks.
   useEffect(() => {
-    const CHARS_PER_FRAME = 3; // Base speed: ~180 chars/sec at 60fps
+    const CHARS_PER_FRAME = 5; // Base speed: ~300 chars/sec at 60fps — smooth typewriter feel
     const MIN_FRAME_INTERVAL = 16; // ~60fps cap
 
     let lastUpdate = 0;
@@ -184,9 +184,10 @@ export function ChatView() {
         const contentTarget = contentBuffer.length;
         const currentContentLen = displayedContentLenRef.current;
         if (currentContentLen < contentTarget) {
-          // Adaptive speed: reveal faster when there's a lot queued up
+          // Adaptive speed: catch up aggressively when there's a backlog so text
+          // never appears to "stutter" — large queue → fast reveal, small queue → smooth
           const queueSize = contentTarget - currentContentLen;
-          const speed = queueSize > 200 ? 12 : queueSize > 100 ? 8 : queueSize > 50 ? 5 : CHARS_PER_FRAME;
+          const speed = queueSize > 100 ? 20 : queueSize > 50 ? 12 : queueSize > 20 ? 8 : CHARS_PER_FRAME;
           const newLen = Math.min(currentContentLen + speed, contentTarget);
           displayedContentLenRef.current = newLen;
           setStreamingContent(contentBuffer.slice(0, newLen));
@@ -198,7 +199,7 @@ export function ChatView() {
         const currentThinkingLen = displayedThinkingLenRef.current;
         if (currentThinkingLen < thinkingTarget) {
           const queueSize = thinkingTarget - currentThinkingLen;
-          const speed = queueSize > 200 ? 12 : queueSize > 100 ? 8 : queueSize > 50 ? 5 : CHARS_PER_FRAME;
+          const speed = queueSize > 100 ? 20 : queueSize > 50 ? 12 : queueSize > 20 ? 8 : CHARS_PER_FRAME;
           const newLen = Math.min(currentThinkingLen + speed, thinkingTarget);
           displayedThinkingLenRef.current = newLen;
           setStreamingThinking(thinkingBuffer.slice(0, newLen));

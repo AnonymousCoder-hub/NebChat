@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================
-#  NebChat Colab Setup — v3.1
-#  Ollama + Agentic Search + Crawl4AI + Flask Bridge + ngrok
+#  NebChat Colab Setup — v4.0
+#  Ollama + Playwright + Crawl4AI + Flask Bridge + ngrok
 #  Features: AI-powered web search, page reading, reasoning_effort
-#  Search: SearXNG + Wikipedia + DDG HTML + DDG library
-#  Content: Trafilatura + Jina Reader + Crawl4AI + BeautifulSoup
+#  Search: Playwright (Bing) → Wikipedia API → DDG HTML fallback
+#  Content: Playwright → Jina Reader → Crawl4AI → Trafilatura → BS4
 #  Run this ENTIRE script in a single Colab cell.
 # ============================================================
 
@@ -39,22 +39,29 @@ def setup_system():
     try:
         import trafilatura
     except:
-        print("📄 Installing Trafilatura (primary content extractor)...")
+        print("📄 Installing Trafilatura (content extractor)...")
         os.system("pip install -q trafilatura")
     try:
         from bs4 import BeautifulSoup
     except:
-        print("🍲 Installing BeautifulSoup4 (fallback HTML parser)...")
+        print("🍲 Installing BeautifulSoup4...")
         os.system("pip install -q beautifulsoup4")
-    try:
-        from duckduckgo_search import DDGS
-    except:
-        print("🔍 Installing DuckDuckGo Search (fallback)...")
-        os.system("pip install -q duckduckgo-search")
     try:
         import requests
     except:
         os.system("pip install -q requests")
+
+    # Install Playwright + Chromium (primary search & content engine)
+    try:
+        from playwright.async_api import async_playwright
+    except:
+        print("🎭 Installing Playwright...")
+        os.system("pip install -q playwright")
+    print("🎭 Installing Chromium browser for Playwright...")
+    os.system("playwright install chromium 2>/dev/null || pip install -q playwright && playwright install chromium")
+    # Install system deps for Chromium on Linux
+    os.system("playwright install-deps chromium 2>/dev/null || true")
+
     if shutil.which("ollama") is None:
         print("⬇️ Installing Ollama...")
         os.system("curl -fsSL https://ollama.com/install.sh | sh")
@@ -203,12 +210,11 @@ def write_bridge_file():
     return bridge_path
 
 BRIDGE_CODE = r'''#!/usr/bin/env python3
-# NebChat Agentic Bridge v3.1 — Flask application
-# Supports: Ollama proxy, Agentic search/crawl, SSE keepalive
-# Search: SearXNG -> Wikipedia -> DDG HTML -> DDG library
-# Content: Trafilatura -> Jina Reader -> Crawl4AI -> BeautifulSoup
+# NebChat Agentic Bridge v4.0 — Flask application
+# Search: Playwright (Bing) -> Wikipedia API -> DDG HTML
+# Content: Playwright -> Jina Reader -> Crawl4AI -> Trafilatura -> BS4
 
-import os, sys, time, json, traceback, threading, queue, random, re
+import os, sys, time, json, traceback, threading, queue, re, asyncio
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 from flask import Flask, Response, request, jsonify, stream_with_context
@@ -222,19 +228,6 @@ CRAWL4AI_BASE = f"http://localhost:{PORT_CRAWL4AI}"
 JINA_READER_URL = "https://r.jina.ai/"
 KEEPALIVE_INTERVAL = 15
 AGENTIC_MAX_ROUNDS = 5
-
-# SearXNG public instances — shuffled for load distribution
-SEARXNG_INSTANCES = [
-    "https://searx.rhscz.eu",
-    "https://search.zina.dev",
-    "https://search.bladerunn.in",
-    "https://searx.be",
-    "https://search.bus-hit.me",
-    "https://searx.fmac.xyz",
-    "https://search.mdosch.de",
-    "https://searxng.ch",
-    "https://search.sapti.me",
-]
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -254,6 +247,163 @@ def _log_req():
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] #{rid:05d} {request.method} {request.path}", flush=True)
 
+# ==================== PLAYWRIGHT BROWSER POOL ====================
+# Reuse a single browser instance across requests for speed.
+# Each request gets its own page (tab) for isolation.
+
+_pw_browser = None
+_pw_browser_lock = threading.Lock()
+
+def _get_playwright_browser():
+    """Lazily initialize a single Playwright Chromium browser instance."""
+    global _pw_browser
+    if _pw_browser is not None:
+        return _pw_browser
+    with _pw_browser_lock:
+        if _pw_browser is not None:
+            return _pw_browser
+        try:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            _pw_browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-extensions',
+                    '--single-process',
+                ]
+            )
+            print("[PLAYWRIGHT] Browser launched", flush=True)
+        except Exception as e:
+            print(f"[PLAYWRIGHT] Failed to launch browser: {e}", flush=True)
+            _pw_browser = None
+    return _pw_browser
+
+def _pw_search_bing(query, max_results=10):
+    """Search Bing via Playwright headless browser. Most reliable search method."""
+    browser = _get_playwright_browser()
+    if not browser:
+        return None
+    try:
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1280, 'height': 720}
+        )
+        page = context.new_page()
+        try:
+            encoded_q = urllib.parse.quote(query, safe='')
+            page.goto(f'https://www.bing.com/search?q={encoded_q}&count={max_results}', timeout=15000, wait_until='domcontentloaded')
+            page.wait_for_timeout(1500)
+
+            results = page.evaluate('''(maxResults) => {
+                const items = [];
+                const results = document.querySelectorAll('#b_results li.b_algo');
+                results.forEach(li => {
+                    if (items.length >= maxResults) return;
+                    const titleEl = li.querySelector('h2 a');
+                    const snippetEl = li.querySelector('.b_caption p, .b_lineclamp2, p');
+                    if (titleEl) {
+                        let url = titleEl.href || '';
+                        // Clean Bing redirect URLs
+                        if (url.includes('bing.com/ck/')) {
+                            // Try to extract from data attribs
+                            const realUrl = titleEl.getAttribute('href');
+                            url = realUrl || url;
+                        }
+                        items.push({
+                            title: titleEl.textContent?.trim() || '',
+                            url: url,
+                            snippet: snippetEl ? snippetEl.textContent?.trim() : ''
+                        });
+                    }
+                });
+                return items;
+            }''', max_results)
+
+            context.close()
+            if results:
+                # Clean up Bing redirect URLs
+                for r in results:
+                    url = r.get('url', '')
+                    if 'bing.com/ck/' in url or url.startswith('/'):
+                        # These are redirect URLs, try to keep them anyway
+                        # They still work as clickable links
+                        pass
+                    r['snippet'] = (r.get('snippet', '') or '')[:500]
+                print(f"[SEARCH] Playwright/Bing returned {len(results)} results", flush=True)
+                return results
+        except Exception as e:
+            print(f"[SEARCH] Playwright/Bing page error: {e}", flush=True)
+        try:
+            context.close()
+        except:
+            pass
+    except Exception as e:
+        print(f"[SEARCH] Playwright/Bing failed: {e}", flush=True)
+    return None
+
+def _pw_extract_page(url, max_chars=5000):
+    """Extract page content via Playwright headless browser. Handles JS-rendered pages."""
+    browser = _get_playwright_browser()
+    if not browser:
+        return None
+    try:
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1280, 'height': 720}
+        )
+        page = context.new_page()
+        try:
+            page.goto(url, timeout=20000, wait_until='domcontentloaded')
+            page.wait_for_timeout(2000)
+
+            content = page.evaluate('''(maxChars) => {
+                // Try to find the main content area
+                const selectors = [
+                    '#mw-content-text',    // Wikipedia
+                    'article',             // News/blog
+                    'main',                // Semantic HTML
+                    '[role="main"]',       // ARIA
+                    '.post-content',       // Blogs
+                    '.article-body',       // News
+                    '#content',            // Generic
+                    '.content',            // Generic
+                ];
+                let main = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText.length > 100) {
+                        main = el;
+                        break;
+                    }
+                }
+                if (!main) main = document.body;
+
+                // Clone and clean
+                const clone = main.cloneNode(true);
+                clone.querySelectorAll('script, style, nav, footer, header, aside, iframe, noscript, .ad, .advertisement, .cookie-banner, .popup, .modal, .sidebar').forEach(el => el.remove());
+
+                const text = clone.innerText || clone.textContent || '';
+                return text.substring(0, maxChars);
+            }''', max_chars)
+
+            context.close()
+            if content and len(content.strip()) > 50:
+                print(f"[EXTRACT] Playwright extracted {len(content)} chars from {url[:60]}", flush=True)
+                return content
+        except Exception as e:
+            print(f"[EXTRACT] Playwright page error: {e}", flush=True)
+        try:
+            context.close()
+        except:
+            pass
+    except Exception as e:
+        print(f"[EXTRACT] Playwright failed: {e}", flush=True)
+    return None
+
 # ==================== QUERY TYPE DETECTION ====================
 FACTUAL_PATTERNS = re.compile(
     r'\b(who is|who was|what is|what are|what was|what were|define|definition|meaning of|'
@@ -271,9 +421,7 @@ NEWS_PATTERNS = re.compile(
 )
 
 def _detect_query_type(query):
-    """Detect whether a query is factual, news/real-time, or general.
-    Returns: 'factual', 'news', or 'general'
-    """
+    """Detect whether a query is factual, news/real-time, or general."""
     if NEWS_PATTERNS.search(query):
         return "news"
     if FACTUAL_PATTERNS.search(query):
@@ -286,7 +434,7 @@ AGENTIC_TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for up-to-date information. Returns titles, URLs, and snippets.",
+            "description": "Search the web for up-to-date information. Returns titles, URLs, and snippets. Powered by headless browser for maximum reliability.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -300,7 +448,7 @@ AGENTIC_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_page",
-            "description": "Read the full content of a web page as markdown. Use for detailed info from URLs found via search.",
+            "description": "Read the full content of a web page. Handles JavaScript-rendered pages, stock tickers, and dynamic content. Returns clean text.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -314,57 +462,13 @@ AGENTIC_TOOLS = [
 
 # ==================== SEARCH IMPLEMENTATIONS ====================
 
-def _search_searxng(query, max_results=10, categories="general"):
-    """SearXNG metasearch — aggregates Google + Bing + 250+ engines via public instances."""
-    instances = SEARXNG_INSTANCES[:]
-    random.shuffle(instances)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    }
-    for instance in instances:
-        try:
-            params = {
-                "q": query,
-                "format": "json",
-                "categories": categories,
-                "language": "en",
-            }
-            resp = req_lib.get(
-                f"{instance}/search",
-                params=params,
-                headers=headers,
-                timeout=10,
-                allow_redirects=True,
-            )
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            results = []
-            for item in data.get("results", [])[:max_results]:
-                # SearXNG results can have different fields
-                title = item.get("title", "")
-                url = item.get("url", item.get("link", ""))
-                snippet = item.get("content", item.get("snippet", ""))
-                if not url:
-                    continue
-                results.append({
-                    "title": title,
-                    "url": url,
-                    "snippet": (snippet or "")[:500],
-                })
-            if results:
-                print(f"[SEARCH] SearXNG hit from {instance} ({len(results)} results)", flush=True)
-                return results
-        except Exception as e:
-            print(f"[SEARCH] SearXNG {instance} failed: {e}", flush=True)
-            continue
-    return None
+def _search_playwright_bing(query, max_results=10):
+    """Playwright headless Bing search — PRIMARY method. Real browser, real results."""
+    return _pw_search_bing(query, max_results)
 
 def _search_wikipedia(query, max_results=5):
     """Wikipedia API search — excellent for factual/encyclopedic queries."""
     try:
-        # Step 1: Search for pages matching the query
         search_params = {
             "action": "query",
             "list": "search",
@@ -377,7 +481,7 @@ def _search_wikipedia(query, max_results=5):
             "https://en.wikipedia.org/w/api.php",
             params=search_params,
             timeout=10,
-            headers={"User-Agent": "NebChatBridge/3.1 (https://github.com/nebchat)"},
+            headers={"User-Agent": "NebChatBridge/4.0 (https://github.com/nebchat)"},
         )
         if resp.status_code != 200:
             return None
@@ -389,7 +493,6 @@ def _search_wikipedia(query, max_results=5):
         results = []
         page_ids = [str(r["pageid"]) for r in search_results]
 
-        # Step 2: Get extracts (content snippets) for found pages
         extract_params = {
             "action": "query",
             "prop": "extracts",
@@ -404,7 +507,7 @@ def _search_wikipedia(query, max_results=5):
             "https://en.wikipedia.org/w/api.php",
             params=extract_params,
             timeout=10,
-            headers={"User-Agent": "NebChatBridge/3.1 (https://github.com/nebchat)"},
+            headers={"User-Agent": "NebChatBridge/4.0 (https://github.com/nebchat)"},
         )
         extracts = {}
         if extract_resp.status_code == 200:
@@ -417,7 +520,6 @@ def _search_wikipedia(query, max_results=5):
             title = item.get("title", "")
             url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
             snippet = extracts.get(page_id, item.get("snippet", ""))
-            # Clean HTML from snippet if present
             snippet = re.sub(r'<[^>]+>', '', snippet)[:500]
             results.append({
                 "title": f"{title} — Wikipedia",
@@ -432,7 +534,7 @@ def _search_wikipedia(query, max_results=5):
         return None
 
 def _search_ddg_html(query, max_results=8):
-    """DuckDuckGo HTML scraping — reliable fallback using BeautifulSoup."""
+    """DuckDuckGo HTML scraping — lightweight fallback (no browser needed)."""
     try:
         from bs4 import BeautifulSoup
         ddg_url = "https://html.duckduckgo.com/html/"
@@ -452,7 +554,6 @@ def _search_ddg_html(query, max_results=8):
                 continue
             title = title_tag.get_text(strip=True)
             href = title_tag.get("href", "")
-            # DDG HTML uses redirect URLs — extract the real URL
             if href and "uddg=" in href:
                 real_url = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [href])
                 href = real_url[0] if real_url else href
@@ -472,53 +573,14 @@ def _search_ddg_html(query, max_results=8):
         print(f"[SEARCH] DDG HTML failed: {e}", flush=True)
         return None
 
-def _search_ddg_library(query, max_results=8):
-    """DuckDuckGo Search library — kept as final fallback."""
-    try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            ddg_results = list(ddgs.text(query, max_results=max_results))
-        if ddg_results:
-            results = []
-            for r in ddg_results:
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", "")[:500],
-                })
-            print(f"[SEARCH] DDG library returned {len(results)} results", flush=True)
-            return results
-    except Exception as e:
-        print(f"[SEARCH] DDG library failed: {e}", flush=True)
-    return None
-
 # ==================== CONTENT EXTRACTION IMPLEMENTATIONS ====================
 
-def _extract_trafilatura(url):
-    """Trafilatura — fast, high-quality content extraction from web pages."""
-    try:
-        import trafilatura
-        # Download the page
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
-            return None
-        # Extract main content as markdown
-        content = trafilatura.extract(
-            downloaded,
-            output_format="markdown",
-            include_links=True,
-            include_tables=True,
-            favor_precision=True,
-        )
-        if content and len(content.strip()) > 50:
-            print(f"[EXTRACT] Trafilatura extracted {len(content)} chars from {url}", flush=True)
-            return content[:5000]
-    except Exception as e:
-        print(f"[EXTRACT] Trafilatura failed: {e}", flush=True)
-    return None
+def _extract_playwright(url):
+    """Playwright headless browser — PRIMARY extraction. Handles JS-rendered pages perfectly."""
+    return _pw_extract_page(url, max_chars=5000)
 
 def _extract_jina_reader(url):
-    """Jina Reader — good for JS-heavy sites that need server-side rendering."""
+    """Jina Reader — good free fallback for server-side rendering."""
     try:
         jina_url = f"{JINA_READER_URL}{urllib.parse.quote(url, safe=':/?#[]@!$&()*+,;=')}"
         headers = {"Accept": "text/markdown"}
@@ -528,14 +590,14 @@ def _extract_jina_reader(url):
         resp = req_lib.get(jina_url, headers=headers, timeout=20, allow_redirects=True)
         content = resp.text
         if content and len(content.strip()) > 50:
-            print(f"[EXTRACT] Jina Reader extracted {len(content)} chars from {url}", flush=True)
+            print(f"[EXTRACT] Jina Reader extracted {len(content)} chars from {url[:60]}", flush=True)
             return content[:5000]
     except Exception as e:
         print(f"[EXTRACT] Jina Reader failed: {e}", flush=True)
     return None
 
 def _extract_crawl4ai(url):
-    """Crawl4AI — browser-based extraction for dynamic pages."""
+    """Crawl4AI — browser-based extraction (separate service)."""
     try:
         resp = req_lib.post(f"{CRAWL4AI_BASE}/crawl", json={"url": url}, timeout=60)
         if resp.ok:
@@ -548,14 +610,35 @@ def _extract_crawl4ai(url):
                 elif isinstance(c, str):
                     content = c
             if content and len(content.strip()) > 50:
-                print(f"[EXTRACT] Crawl4AI extracted {len(content)} chars from {url}", flush=True)
+                print(f"[EXTRACT] Crawl4AI extracted {len(content)} chars from {url[:60]}", flush=True)
                 return content[:5000]
     except Exception as e:
         print(f"[EXTRACT] Crawl4AI failed: {e}", flush=True)
     return None
 
+def _extract_trafilatura(url):
+    """Trafilatura — fast content extraction from static HTML."""
+    try:
+        import trafilatura
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return None
+        content = trafilatura.extract(
+            downloaded,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            favor_precision=True,
+        )
+        if content and len(content.strip()) > 50:
+            print(f"[EXTRACT] Trafilatura extracted {len(content)} chars from {url[:60]}", flush=True)
+            return content[:5000]
+    except Exception as e:
+        print(f"[EXTRACT] Trafilatura failed: {e}", flush=True)
+    return None
+
 def _extract_beautifulsoup(url):
-    """BeautifulSoup fallback — basic HTML to text extraction."""
+    """BeautifulSoup fallback — basic HTML to text."""
     try:
         from bs4 import BeautifulSoup
         headers = {
@@ -565,20 +648,17 @@ def _extract_beautifulsoup(url):
         if resp.status_code != 200:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
-        # Remove unwanted elements
         for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]):
             tag.decompose()
-        # Try to find main content area
         main = soup.find("main") or soup.find("article") or soup.find("div", class_=re.compile(r"content|article|post|entry", re.I))
         if main:
             text = main.get_text(separator="\n", strip=True)
         else:
             text = soup.get_text(separator="\n", strip=True)
-        # Clean up excessive whitespace
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         text = "\n".join(lines)
         if text and len(text) > 50:
-            print(f"[EXTRACT] BeautifulSoup extracted {len(text)} chars from {url}", flush=True)
+            print(f"[EXTRACT] BeautifulSoup extracted {len(text)} chars from {url[:60]}", flush=True)
             return text[:5000]
     except Exception as e:
         print(f"[EXTRACT] BeautifulSoup failed: {e}", flush=True)
@@ -587,69 +667,59 @@ def _extract_beautifulsoup(url):
 # ==================== UNIFIED TOOL EXECUTION ====================
 
 def _tool_web_search(query, max_results=10):
-    """Multi-layer search: SearXNG -> Wikipedia -> DDG HTML -> DDG library.
-    Automatically routes factual queries to Wikipedia first,
-    and news/real-time queries to SearXNG with categories=news.
+    """Search: Playwright/Bing -> Wikipedia -> DDG HTML.
+    Routes factual queries to Wikipedia first for speed.
     """
     query_type = _detect_query_type(query)
     print(f"[AGENTIC] Search query type: {query_type} for: '{query[:80]}'", flush=True)
 
-    results = None
-
-    # For factual queries, try Wikipedia first (most reliable for facts)
+    # For factual queries, try Wikipedia first (fast, no browser needed)
     if query_type == "factual":
         results = _search_wikipedia(query, max_results=max_results)
         if results:
             return json.dumps(results)
 
-    # For news/real-time queries, use SearXNG with news category
-    if query_type == "news":
-        results = _search_searxng(query, max_results=max_results, categories="news")
-        if results:
-            return json.dumps(results)
-        # Fall through to general SearXNG
-
-    # Primary: SearXNG general search (aggregates Google + Bing + 250+ engines)
-    results = _search_searxng(query, max_results=max_results, categories="general")
+    # Primary: Playwright headless Bing search (most reliable, real browser)
+    results = _search_playwright_bing(query, max_results=max_results)
     if results:
         return json.dumps(results)
 
-    # For factual queries that didn't get Wikipedia results, try it now as fallback
+    # Fallback: Wikipedia (for non-factual that didn't try it yet)
     if query_type != "factual":
         results = _search_wikipedia(query, max_results=max_results)
         if results:
             return json.dumps(results)
 
-    # Fallback: DDG HTML scraping
+    # Fallback: DDG HTML (lightweight, no browser)
     results = _search_ddg_html(query, max_results=max_results)
-    if results:
-        return json.dumps(results)
-
-    # Final fallback: DDG library
-    results = _search_ddg_library(query, max_results=max_results)
     if results:
         return json.dumps(results)
 
     return json.dumps({"error": "All search methods failed"})
 
 def _tool_read_page(url):
-    """Multi-layer content extraction: Trafilatura -> Jina Reader -> Crawl4AI -> BeautifulSoup."""
-    # Primary: Trafilatura (fast, high quality)
-    content = _extract_trafilatura(url)
+    """Extract: Playwright -> Jina Reader -> Crawl4AI -> Trafilatura -> BS4."""
+    # Primary: Playwright headless browser (handles JS, stock tickers, etc.)
+    content = _extract_playwright(url)
     if content:
         return content[:4000]
 
-    # Fallback 1: Jina Reader (good for JS-heavy sites)
+    # Fallback 1: Jina Reader
     content = _extract_jina_reader(url)
     if content:
         return content[:4000]
 
-    # Fallback 2: Crawl4AI (browser-based, handles dynamic pages)
+    # Fallback 2: Crawl4AI
     content = _extract_crawl4ai(url)
     if content:
         return content[:4000]
 
-    # Fallback 3: BeautifulSoup (basic HTML parsing)
+    # Fallback 3: Trafilatura
+    content = _extract_trafilatura(url)
+    if content:
+        return content[:4000]
+
+    # Fallback 4: BeautifulSoup
     content = _extract_beautifulsoup(url)
     if content:
         return content[:4000]
@@ -749,33 +819,30 @@ def _stream_response(upstream_url, method, headers, body):
     return Response(stream_with_context(generate()), content_type=content_type)
 
 def _simulated_stream(content, thinking, model):
-    """Simulate SSE streaming for agentic responses — sends in chunks for smooth display."""
+    """Simulate SSE streaming for agentic responses."""
     def generate():
         chunk_id = f"chatcmpl-{int(time.time()*1000)}"
         ts = int(time.time())
 
-        # Send thinking content first (if any)
         if thinking:
-            for i in range(0, len(thinking), 30):
+            for i in range(0, len(thinking), 12):
                 data = {
                     "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
-                    "choices": [{"index": 0, "delta": {"reasoning_content": thinking[i:i+30]}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"reasoning_content": thinking[i:i+12]}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
 
-        # Send content in chunks
-        for i in range(0, len(content), 20):
+        for i in range(0, len(content), 8):
             delta = {}
             if i == 0:
                 delta["role"] = "assistant"
-            delta["content"] = content[i:i+20]
+            delta["content"] = content[i:i+8]
             data = {
                 "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
             }
             yield f"data: {json.dumps(data)}\n\n"
 
-        # Done
         data = {
             "id": chunk_id, "object": "chat.completion.chunk", "created": ts, "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
@@ -804,34 +871,32 @@ def _ollama_call(body_json):
         return json.loads(resp.read())
 
 AGENTIC_SYSTEM_PROMPT = """You are an AI assistant with web search and page reading capabilities. You have access to the following tools:
-- web_search: Search the web for current, up-to-date information. Returns titles, URLs, and snippets.
-- read_page: Read the full content of a web page as markdown. Use for detailed info from URLs found via search.
+- web_search: Search the web for current, up-to-date information. Returns titles, URLs, and snippets. Powered by a headless browser for maximum reliability.
+- read_page: Read the full content of a web page. Handles JavaScript-rendered pages, stock tickers, and dynamic content. Use for detailed info from URLs found via search.
 
 CRITICAL RULES:
 1. When the user asks about current events, stock prices, weather, news, recent data, or ANY time-sensitive information, you MUST use the web_search tool FIRST before responding. Do NOT say you cannot access the internet — you CAN and MUST search.
 2. When the user asks "what is the price of X", "what happened today", "latest news about Y", or similar real-time queries, ALWAYS call web_search immediately.
-3. After searching, if you need more detailed information from a specific URL, use the read_page tool to get the full content.
+3. After searching, if you need more detailed information from a specific URL, use the read_page tool to get the full content. This is especially useful for stock prices, weather, and detailed articles.
 4. Only respond without searching if the question is about general knowledge, math, coding, or topics that don't require current data.
 5. Never say "I don't have access to real-time data" or "I can't browse the internet" — you CAN search using your tools.
-6. Always cite your sources by including URLs from the search results in your response."""
+6. Always cite your sources by including URLs from the search results in your response.
+7. When you read a page, extract the key facts and data — don't just summarize the page structure."""
 
 def _handle_agentic(body_json, should_stream):
     """Agentic loop: AI decides when to search/read, executes tools, returns final answer."""
     messages = list(body_json.get("messages", []))
     model = body_json.get("model", "qwen3:8b")
 
-    # Inject agentic system prompt if no system message exists
     has_system = any(m.get("role") == "system" for m in messages)
     if not has_system:
         messages.insert(0, {"role": "system", "content": AGENTIC_SYSTEM_PROMPT})
     else:
-        # Prepend agentic instructions to existing system prompt
         for m in messages:
             if m.get("role") == "system":
                 m["content"] = AGENTIC_SYSTEM_PROMPT + "\n\n" + m.get("content", "")
                 break
 
-    # Inject tools
     body_json["tools"] = AGENTIC_TOOLS
     body_json["tool_choice"] = "auto"
 
@@ -849,9 +914,8 @@ def _handle_agentic(body_json, should_stream):
         tool_calls = message.get("tool_calls", [])
 
         if not tool_calls:
-            break  # Final response — no more tool calls
+            break
 
-        # Process tool calls
         messages.append(message)
         for tc in tool_calls:
             func = tc.get("function", {})
@@ -868,7 +932,6 @@ def _handle_agentic(body_json, should_stream):
                 "content": result,
             })
 
-    # Get final content
     if response_data is None:
         return jsonify({"error": "No response from Ollama"}), 502
 
@@ -886,16 +949,17 @@ def _handle_agentic(body_json, should_stream):
 def index():
     return jsonify({
         "service": "NebChat Agentic Bridge",
-        "version": "3.1",
+        "version": "4.0",
         "agentic": True,
+        "engine": "Playwright",
         "endpoints": {
             "GET /": "Status page",
             "GET /v1/models": "List Ollama models",
             "POST /v1/chat/completions": "Chat (supports agentic mode with tools)",
             "* /v1/<path>": "Proxy to Ollama /v1/*",
             "* /api/<path>": "Proxy to Ollama /api/*",
-            "GET /search?q=...": "Search (SearXNG + Wikipedia + DDG fallback)",
-            "POST /crawl": "Read page (Trafilatura + Jina + Crawl4AI + BS4 fallback)",
+            "GET /search?q=...": "Search (Playwright/Bing + Wikipedia + DDG fallback)",
+            "POST /crawl": "Read page (Playwright + Jina + Crawl4AI + Trafilatura + BS4)",
             "GET /health": "Health check",
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -921,7 +985,6 @@ def chat_completions():
         should_stream = body_json.get("stream", True)
         return _handle_agentic(body_json, should_stream)
 
-    # Normal proxy
     headers = {"Content-Type": request.content_type or "application/json"}
     return _stream_response(
         _proxy_url(OLLAMA_BASE, "v1/chat/completions"),
@@ -961,41 +1024,29 @@ def search():
     source = "none"
     results = None
 
-    # For factual queries, try Wikipedia first
+    # For factual queries, try Wikipedia first (fast, no browser needed)
     if query_type == "factual":
         results = _search_wikipedia(query, max_results=max_results)
         if results:
             source = "wikipedia"
 
-    # For news queries, try SearXNG news category first
-    if not results and query_type == "news":
-        results = _search_searxng(query, max_results=max_results, categories="news")
-        if results:
-            source = "searxng_news"
-
-    # General SearXNG search (primary for most queries)
+    # Primary: Playwright/Bing (real browser, most reliable)
     if not results:
-        results = _search_searxng(query, max_results=max_results, categories="general")
+        results = _search_playwright_bing(query, max_results=max_results)
         if results:
-            source = "searxng"
+            source = "playwright_bing"
 
-    # Wikipedia fallback (for non-factual queries that didn't try Wikipedia yet)
+    # Fallback: Wikipedia (for non-factual queries)
     if not results and query_type != "factual":
         results = _search_wikipedia(query, max_results=max_results)
         if results:
             source = "wikipedia"
 
-    # DDG HTML scraping fallback
+    # Fallback: DDG HTML (lightweight)
     if not results:
         results = _search_ddg_html(query, max_results=max_results)
         if results:
             source = "ddg_html"
-
-    # DDG library fallback
-    if not results:
-        results = _search_ddg_library(query, max_results=max_results)
-        if results:
-            source = "ddg_library"
 
     if results:
         formatted = []
@@ -1020,10 +1071,10 @@ def crawl():
     if not url:
         return jsonify({"error": "Missing 'url' in request body"}), 400
 
-    # Primary: Trafilatura
-    content = _extract_trafilatura(url)
+    # Primary: Playwright (handles JS, dynamic content, stock tickers)
+    content = _extract_playwright(url)
     if content:
-        return jsonify({"url": url, "source": "trafilatura", "content": {"markdown": content}, "success": True, "status_code": 200})
+        return jsonify({"url": url, "source": "playwright", "content": {"markdown": content}, "success": True, "status_code": 200})
 
     # Fallback 1: Jina Reader
     content = _extract_jina_reader(url)
@@ -1035,14 +1086,19 @@ def crawl():
     if content:
         return jsonify({"url": url, "source": "crawl4ai", "content": {"markdown": content}, "success": True, "status_code": 200})
 
-    # Fallback 3: BeautifulSoup
+    # Fallback 3: Trafilatura
+    content = _extract_trafilatura(url)
+    if content:
+        return jsonify({"url": url, "source": "trafilatura", "content": {"markdown": content}, "success": True, "status_code": 200})
+
+    # Fallback 4: BeautifulSoup
     content = _extract_beautifulsoup(url)
     if content:
         return jsonify({"url": url, "source": "beautifulsoup", "content": {"markdown": content}, "success": True, "status_code": 200})
 
     return jsonify({
         "url": url, "source": "none", "content": {"markdown": ""},
-        "success": False, "error": "All content extraction methods failed (Trafilatura, Jina Reader, Crawl4AI, BeautifulSoup)",
+        "success": False, "error": "All content extraction methods failed",
     }), 502
 
 @app.route("/health", methods=["GET"])
@@ -1062,9 +1118,8 @@ def health():
         services["crawl4ai"] = {"status": "ok"}
     except:
         services["crawl4ai"] = {"status": "offline"}
-    services["searxng"] = {"status": "available", "instances": len(SEARXNG_INSTANCES)}
+    services["playwright"] = {"status": "available" if _get_playwright_browser() else "unavailable"}
     services["wikipedia"] = {"status": "available"}
-    services["trafilatura"] = {"status": "available"}
     services["agentic"] = {"status": "enabled"}
     return jsonify({"status": "ok", "services": services})
 
@@ -1078,12 +1133,12 @@ def server_error(e):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  NebChat Agentic Bridge v3.1")
-    print(f"  Ollama:   {OLLAMA_BASE}")
-    print(f"  Crawl4AI: {CRAWL4AI_BASE}")
-    print(f"  Search:   SearXNG ({len(SEARXNG_INSTANCES)} instances) + Wikipedia + DDG")
-    print(f"  Extract:  Trafilatura + Jina Reader + Crawl4AI + BS4")
-    print(f"  Agentic:  Enabled (max {AGENTIC_MAX_ROUNDS} rounds)")
+    print("  NebChat Agentic Bridge v4.0")
+    print(f"  Ollama:     {OLLAMA_BASE}")
+    print(f"  Crawl4AI:   {CRAWL4AI_BASE}")
+    print(f"  Search:     Playwright/Bing + Wikipedia + DDG")
+    print(f"  Extract:    Playwright + Jina + Crawl4AI + Trafilatura + BS4")
+    print(f"  Agentic:    Enabled (max {AGENTIC_MAX_ROUNDS} rounds)")
     print("=" * 60)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT_BRIDGE", 5000)), debug=False, threaded=True)
 '''
@@ -1147,11 +1202,12 @@ def start_bridge_and_tunnel():
     print(f"\n📝 In NebChat Settings:")
     print(f"   1. Add Provider → Base URL: {BASE}")
     print(f"   2. Add Provider → API Key:  ollama")
-    print(f"   3. Add Search  → Type: SearXNG → URL: {BASE}")
+    print(f"   3. Add Search  → Type: Colab Bridge → URL: {BASE}")
     print(f"   4. Page Reader URL:          {BASE}")
     print(f"\n🤖 Agentic Mode: AI can search & read web pages autonomously!")
     print(f"   Toggle Search ON in chat → AI decides when to search")
-    print(f"\n🔧 Routes: /v1/* → Ollama | /search → SearXNG+Wiki+DDG | /crawl → Trafilatura+Jina+Crawl4AI+BS4")
+    print(f"\n🎭 Search Engine: Playwright headless browser (Bing) — 100% free, unlimited, reliable!")
+    print(f"\n🔧 Routes: /v1/* → Ollama | /search → Playwright+Wiki+DDG | /crawl → Playwright+Jina+Crawl4AI+Trafilatura+BS4")
     print(f"💡 reasoning_effort: Send in chat request body (high/none)")
     print("=" * 60)
 
@@ -1170,7 +1226,7 @@ def health_monitor(interval=120):
             print(f"❌ Health check failed: {exc}")
 
 # -------------------- RUN --------------------
-print("🐝 Starting NebChat Colab Stack...")
+print("🐝 Starting NebChat Colab Stack v4.0...")
 print("=" * 60)
 
 setup_system()
@@ -1187,16 +1243,15 @@ threading.Thread(target=health_monitor, daemon=True).start()
 # Colab keepalive
 try:
     from google.colab import output
-    js_code = """
-    function KeepAlive() {
-      console.log("Colab keepalive ping");
-      document.querySelector("colab-connect-button")?.shadowRoot?.querySelector("#connect")?.click();
-    }
-    setInterval(KeepAlive, 60000);
-    """
-    output.eval_js(js_code)
-    print("✅ Colab keepalive active (60s interval)")
+    output.eval_js('''
+        async function keepalive() {
+            const url = new URL(window.location);
+            url.searchParams.set('rand', Math.random());
+            await fetch(url.toString());
+        }
+        setInterval(keepalive, 300000);
+    ''')
 except:
-    print("⚠️ Not running in Colab — keepalive skipped")
+    pass
 
-print("\n🔄 Colab cell will stay alive. Don't close this tab!")
+print("\n✅ All done! NebChat is running.")
