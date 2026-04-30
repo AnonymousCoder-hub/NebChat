@@ -57,8 +57,16 @@ def install_deps():
     print("✅ All dependencies ready!\n")
 
 
+# ═══════════════════════════════════════════════
+# RUN install_deps() AT MODULE LEVEL NOW
+# This guarantees packages are installed BEFORE
+# the imports below this line execute.
+# ═══════════════════════════════════════════════
+install_deps()
+
 # ─────────────────────────────────────────────
 # STEP 2: NOW we can safely import everything
+# (these run AFTER install_deps() completes)
 # ─────────────────────────────────────────────
 import json
 import time
@@ -825,10 +833,7 @@ def monitor(interval=120):
 
 
 if __name__ == "__main__":
-    # Step 1: Install dependencies (BEFORE any other imports happen)
-    install_deps()
-
-    # Step 2: Clean up, start services
+    # Clean up, start services
     cleanup_old_processes()
     start_ollama()
     ensure_models()
