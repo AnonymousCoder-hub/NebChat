@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NebChat v6.0 — Ollama + Playwright + Flask Bridge + ngrok
-Playwright ONLY for search & content. Thread-safe.
+NebChat v6.1 — Ollama + Playwright + Flask Bridge + ngrok
+Google search (primary) + Bing (fallback). 32K context.
 Paste this ENTIRE script in a single Colab cell and run.
 """
 
@@ -13,10 +13,8 @@ import subprocess
 # STEP 1: Install Python packages FIRST
 # ─────────────────────────────────────────────
 def install_deps():
-    """Install Python packages needed before we import them."""
     print("📦 Installing Python packages...")
-    pip_pkgs = ["flask", "flask-cors", "pyngrok", "requests", "playwright"]
-    for pkg in pip_pkgs:
+    for pkg in ["flask", "flask-cors", "pyngrok", "requests", "playwright"]:
         mod_name = pkg.replace("-", "_")
         try:
             __import__(mod_name)
@@ -26,12 +24,10 @@ def install_deps():
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
     print("✅ Python packages ready!\n")
 
-
-# Run install at module level before other imports
 install_deps()
 
 # ─────────────────────────────────────────────
-# STEP 2: Safe imports
+# STEP 2: Imports
 # ─────────────────────────────────────────────
 import json
 import asyncio
@@ -72,10 +68,9 @@ OLLAMA_ENV = {
     "OLLAMA_GPU_LAYERS": "999",
     "OLLAMA_FLASH_ATTENTION": "1",
     "OLLAMA_KV_CACHE_TYPE": "q8_0",
-    "OLLAMA_CONTEXT_LENGTH": "8192",
+    "OLLAMA_CONTEXT_LENGTH": "32768",
 }
 
-# Chromium launch flags that actually work on Colab containers
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -91,13 +86,11 @@ CHROMIUM_ARGS = [
 # OLLAMA MANAGEMENT
 # ─────────────────────────────────────────────
 def install_system_deps():
-    """Install system-level deps."""
     if not os.path.exists("/usr/bin/zstd"):
         print("  ⬇️ zstd...")
         os.system("apt-get update -yqq && apt-get install -yqq zstd")
     else:
         print("  ✅ zstd")
-
     if not os.path.exists("/usr/local/bin/ollama"):
         print("  ⬇️ Ollama...")
         os.system("curl -fsSL https://ollama.com/install.sh | sh")
@@ -107,7 +100,6 @@ def install_system_deps():
 
 
 def cleanup_old_processes():
-    """Kill leftover processes."""
     print("🧹 Cleaning up...")
     for proc in ["ollama", "ngrok", "nebchat"]:
         os.system(f"pkill -9 -f {proc} 2>/dev/null")
@@ -117,7 +109,6 @@ def cleanup_old_processes():
 
 
 def start_ollama():
-    """Start Ollama server and wait for ready."""
     env = os.environ.copy()
     env.update(OLLAMA_ENV)
     print("🚀 Starting Ollama...")
@@ -138,7 +129,6 @@ def start_ollama():
 
 
 def ensure_models():
-    """Pull required models if missing."""
     print("📥 Checking models...")
     try:
         existing = [
@@ -156,7 +146,6 @@ def ensure_models():
 
 
 def warmup_models():
-    """Pre-load models into GPU memory."""
     print("🔥 Warming up models...")
     for model in MODELS:
         try:
@@ -194,7 +183,7 @@ def log_request():
 # ─────────────────────────────────────────────
 _pw_loop = None
 _pw_browser = None
-_pw_playwright = None  # keep reference alive
+_pw_playwright = None
 _pw_lock = threading.Lock()
 
 
@@ -202,7 +191,6 @@ def init_playwright():
     """Install Chromium + launch browser. Called during startup."""
     global _pw_loop, _pw_browser, _pw_playwright
 
-    # Step 1: Install Chromium binary
     print("  ⬇️ Installing Chromium...")
     r = subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
@@ -213,8 +201,7 @@ def init_playwright():
     else:
         print("  ✅ Chromium installed")
 
-    # Step 2: Install system deps for Chromium
-    print("  ⬇️ System deps for Chromium (this takes a few minutes on first run)...")
+    print("  ⬇️ System deps for Chromium (few minutes on first run)...")
     r = subprocess.run(
         [sys.executable, "-m", "playwright", "install-deps", "chromium"],
         capture_output=True, text=True, timeout=600,
@@ -224,7 +211,6 @@ def init_playwright():
     else:
         print("  ✅ System deps installed")
 
-    # Step 3: Launch browser in a dedicated thread with its own asyncio loop
     print("  🌐 Launching browser...")
     ready = threading.Event()
     error_holder = [None]
@@ -242,7 +228,6 @@ def init_playwright():
                 args=CHROMIUM_ARGS,
             )
             ready.set()
-            # Keep loop alive
             while True:
                 await asyncio.sleep(3600)
 
@@ -261,9 +246,9 @@ def init_playwright():
     if _pw_browser is None:
         err = error_holder[0] or "timeout"
         print(f"  ❌ Browser launch failed: {err}")
-        return False
+        # Retry with minimal args
+        return _retry_launch()
 
-    # Step 4: Quick test — open a page and close it
     print("  🧪 Testing browser...", flush=True)
     try:
         future = asyncio.run_coroutine_threadsafe(_test_browser(), _pw_loop)
@@ -272,12 +257,10 @@ def init_playwright():
         return True
     except Exception as e:
         print(f"  ❌ Browser test failed: {e}")
-        print("  🔄 Retrying with different settings...")
         return _retry_launch()
 
 
 async def _test_browser():
-    """Open a simple page to verify the browser works."""
     ctx = await _pw_browser.new_context(
         user_agent=USER_AGENT,
         viewport={"width": 1280, "height": 720},
@@ -290,10 +273,8 @@ async def _test_browser():
 
 
 def _retry_launch():
-    """Retry with simpler args if default launch fails."""
     global _pw_loop, _pw_browser, _pw_playwright
 
-    # Close old browser if any
     if _pw_browser:
         try:
             future = asyncio.run_coroutine_threadsafe(_pw_browser.close(), _pw_loop)
@@ -303,8 +284,6 @@ def _retry_launch():
 
     ready = threading.Event()
     error_holder = [None]
-
-    # Fallback: minimal args
     fallback_args = ["--no-sandbox", "--disable-dev-shm-usage"]
 
     def _run_fallback():
@@ -323,7 +302,6 @@ def _retry_launch():
             while True:
                 await asyncio.sleep(3600)
 
-        # Reuse existing loop or create new one
         if _pw_loop is None or _pw_loop.is_closed():
             _pw_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(_pw_loop)
@@ -341,7 +319,6 @@ def _retry_launch():
         print(f"  ❌ Retry also failed: {error_holder[0]}")
         return False
 
-    # Test again
     try:
         future = asyncio.run_coroutine_threadsafe(_test_browser(), _pw_loop)
         future.result(timeout=20)
@@ -353,17 +330,73 @@ def _retry_launch():
 
 
 def _pw_submit(coro):
-    """Submit an async coroutine to the PW event loop, wait for result."""
     if _pw_loop is None or _pw_browser is None:
         raise RuntimeError("Playwright not initialized")
     future = asyncio.run_coroutine_threadsafe(coro, _pw_loop)
     return future.result(timeout=120)
 
 
-# ── Async search & read ──
+# ── Google Search (primary) ──
 
-async def _async_search(query, max_results=10):
-    """Search Bing via Playwright."""
+async def _async_search_google(query, max_results=8):
+    """Search Google. Returns English results."""
+    ctx = None
+    try:
+        ctx = await _pw_browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 720},
+            locale="en-US",
+        )
+        page = await ctx.new_page()
+        url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num={max_results}&hl=en&gl=us"
+        await page.goto(url, timeout=12000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+
+        # Check for captcha
+        page_text = await page.evaluate("() => document.body.innerText || ''")
+        if "sorry" in page_text.lower() and "captcha" in page_text.lower():
+            await ctx.close()
+            return None  # fallback to Bing
+
+        # Extract Google results
+        results = await page.evaluate(
+            "() => ["
+            "  ...document.querySelectorAll('div.g, div[data-ved]')"
+            "].filter(el => el.querySelector('h3') && el.querySelector('a')).slice(0, 8).map(el => ({"
+            "  title: el.querySelector('h3')?.textContent?.trim() || '',"
+            "  url: el.querySelector('a')?.href || '',"
+            "  snippet: (el.querySelector('div.VwiC3b, span.aCOpRe, div[style]')?.textContent || '').trim()"
+            "}))"
+        )
+        await ctx.close()
+        ctx = None
+
+        # Filter out empty/ad results
+        results = [r for r in (results or [])
+                   if r.get('title') and r.get('url') and 'google.com' not in r.get('url', '')]
+
+        if results:
+            for r in results:
+                r["snippet"] = (r.get("snippet", "") or "")[:500]
+            print(f"[SEARCH-G] {len(results)} results for '{query[:40]}'", flush=True)
+            return json.dumps(results)
+
+    except Exception as e:
+        print(f"[SEARCH-G] Error: {e}", flush=True)
+
+    if ctx:
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+
+    return None  # signal to try Bing
+
+
+# ── Bing Search (fallback) ──
+
+async def _async_search_bing(query, max_results=8):
+    """Search Bing. Fallback when Google fails."""
     ctx = None
     try:
         ctx = await _pw_browser.new_context(
@@ -374,23 +407,11 @@ async def _async_search(query, max_results=10):
         page = await ctx.new_page()
         url = (
             f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
-            f"&count={max_results}&setlang=en&cc=US"
+            f"&count={max_results}&setlang=en&cc=US&mkt=en-US"
         )
-        await page.goto(url, timeout=15000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+        await page.goto(url, timeout=12000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
 
-        # Captcha check
-        is_captcha = await page.evaluate(
-            "() => {"
-            "  const t = document.body.innerText || '';"
-            "  return t.includes('captcha') || t.includes('verify you are human');"
-            "}"
-        )
-        if is_captcha:
-            await ctx.close()
-            return json.dumps({"error": "Captcha detected"})
-
-        # Extract results
         results = await page.evaluate(
             "(n) => ["
             "  ...document.querySelectorAll('#b_results li.b_algo')"
@@ -407,11 +428,11 @@ async def _async_search(query, max_results=10):
         if results:
             for r in results:
                 r["snippet"] = (r.get("snippet", "") or "")[:500]
-            print(f"[SEARCH] {len(results)} results for '{query[:40]}'", flush=True)
+            print(f"[SEARCH-B] {len(results)} results for '{query[:40]}'", flush=True)
             return json.dumps(results)
 
     except Exception as e:
-        print(f"[SEARCH] Error: {e}", flush=True)
+        print(f"[SEARCH-B] Error: {e}", flush=True)
 
     if ctx:
         try:
@@ -422,7 +443,20 @@ async def _async_search(query, max_results=10):
     return json.dumps({"error": "Search failed"})
 
 
-async def _async_read_page(url, max_chars=8000):
+# ── Combined search: Google → Bing fallback ──
+
+async def _async_search(query, max_results=8):
+    """Search Google first, fallback to Bing."""
+    result = await _async_search_google(query, max_results)
+    if result:
+        return result
+    print("[SEARCH] Google failed, trying Bing...", flush=True)
+    return await _async_search_bing(query, max_results)
+
+
+# ── Read page ──
+
+async def _async_read_page(url, max_chars=12000):
     """Read any webpage via Playwright."""
     ctx = None
     try:
@@ -432,7 +466,7 @@ async def _async_read_page(url, max_chars=8000):
         )
         page = await ctx.new_page()
         await page.goto(url, timeout=20000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1500)
 
         text = await page.evaluate(
             "(mc) => {"
@@ -477,8 +511,7 @@ async def _async_read_page(url, max_chars=8000):
 
 # ── Public sync wrappers ──
 
-def search_web(query, max_results=10):
-    """Search Bing. Thread-safe wrapper."""
+def search_web(query, max_results=8):
     try:
         if _pw_browser is None:
             return json.dumps({"error": "Browser not available"})
@@ -488,8 +521,7 @@ def search_web(query, max_results=10):
         return json.dumps({"error": f"Search error: {e}"})
 
 
-def read_page(url, max_chars=8000):
-    """Read any webpage. Thread-safe wrapper."""
+def read_page(url, max_chars=12000):
     try:
         if _pw_browser is None:
             return "Browser not available"
@@ -500,7 +532,6 @@ def read_page(url, max_chars=8000):
 
 
 def execute_tool(name, args):
-    """Dispatch a tool call."""
     if name == "web_search":
         return search_web(args.get("query", ""))
     if name == "read_page":
@@ -516,10 +547,10 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for current info via headless browser",
+            "description": "Search the web using Google (primary) or Bing (fallback). Returns list of results with title, url, snippet.",
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}},
+                "properties": {"query": {"type": "string", "description": "Search query in English"}},
                 "required": ["query"],
             },
         },
@@ -528,26 +559,40 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_page",
-            "description": "Read full page content from any URL. Handles JS-rendered pages perfectly.",
+            "description": "Read the full text content of any webpage. Use this AFTER searching to get detailed information from the best URLs. Returns up to 12000 characters of clean text.",
             "parameters": {
                 "type": "object",
-                "properties": {"url": {"type": "string"}},
+                "properties": {"url": {"type": "string", "description": "Full URL to read"}},
                 "required": ["url"],
             },
         },
     },
 ]
 
-SYSTEM_PROMPT = """You are an AI with web search and page reading tools powered by a headless browser. You can search and read any webpage.
+SYSTEM_PROMPT = """You are a research AI with TWO tools: web_search and read_page.
 
-RULES:
-1) For time-sensitive queries (prices, news, weather), MUST web_search FIRST
-2) After searching, use read_page on relevant URLs for detailed content
-3) Search as many times as needed with refined queries
-4) Read as many pages as needed — no limits
-5) Never say you can't browse — you CAN search and read any page
-6) Cite sources with URLs
-7) Keep searching and reading until you have complete, accurate data"""
+CRITICAL RULES - YOU MUST FOLLOW THESE:
+
+1) ALWAYS web_search FIRST for any question about current events, prices, news, or data.
+
+2) AFTER EVERY SEARCH, you MUST use read_page on the top 2-3 URLs from the results.
+   Search results only give titles and short snippets - you need to READ the actual pages to get useful data.
+   NEVER answer based on just search snippets. ALWAYS read pages for details.
+
+3) WORKFLOW FOR EVERY QUERY:
+   Step 1: web_search for relevant information
+   Step 2: read_page on the best 2-3 URLs from results
+   Step 3: If you need more info, web_search again with different keywords
+   Step 4: read_page on new URLs
+   Step 5: Only NOW answer with the detailed information you gathered
+
+4) Use English search queries. If results are not in English, add "in English" to your query.
+
+5) Never say you cannot browse or search - you CAN and MUST use both tools.
+
+6) Cite your sources with URLs.
+
+7) Be concise in your final answer. Don't repeat the search process, just give the answer."""
 
 
 def call_ollama(body):
@@ -559,12 +604,11 @@ def call_ollama(body):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    resp = urllib.request.urlopen(req, timeout=300)
+    resp = urllib.request.urlopen(req, timeout=180)
     return json.loads(resp.read())
 
 
 def make_sse_chunk(chat_id, created, model, delta):
-    """Build a single SSE chunk string."""
     chunk = {
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -576,7 +620,6 @@ def make_sse_chunk(chat_id, created, model, delta):
 
 
 def handle_agentic(body, stream):
-    """Run the agentic tool-calling loop."""
     messages = list(body.get("messages", []))
     model = body.get("model", "qwen3:8b")
 
@@ -592,7 +635,6 @@ def handle_agentic(body, stream):
     body["tools"] = TOOL_DEFINITIONS
     body["tool_choice"] = "auto"
 
-    # ── Non-streaming ──
     if not stream:
         resp = None
         for _ in range(MAX_ROUNDS):
@@ -622,7 +664,6 @@ def handle_agentic(body, stream):
             return jsonify(resp)
         return jsonify({"error": "No response"}), 502
 
-    # ── Streaming ──
     def generate():
         chat_id = f"chatcmpl-{int(time.time() * 1000)}"
         created = int(time.time())
@@ -738,7 +779,6 @@ def handle_agentic(body, stream):
 # STREAM PROXY
 # ─────────────────────────────────────────────
 def proxy_request(url, method, headers, body):
-    """Proxy a request to Ollama."""
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
     try:
@@ -820,7 +860,7 @@ def proxy_request(url, method, headers, body):
 # ─────────────────────────────────────────────
 @app.route("/")
 def index():
-    return jsonify({"name": "NebChat", "v": "6.0", "engine": "Playwright"})
+    return jsonify({"name": "NebChat", "v": "6.1", "engine": "Playwright"})
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -931,7 +971,6 @@ def handle_error(e):
 # MAIN
 # ─────────────────────────────────────────────
 def start_bridge():
-    """Start ngrok tunnel and Flask server."""
     from pyngrok import ngrok
 
     ngrok.set_auth_token(NGROK_TOKEN)
@@ -949,7 +988,6 @@ def start_bridge():
 
 
 def monitor(interval=120):
-    """Periodic health check."""
     while True:
         time.sleep(interval)
         try:
@@ -960,22 +998,18 @@ def monitor(interval=120):
 
 
 if __name__ == "__main__":
-    # Step 1: System deps
     print("📦 System dependencies...")
     install_system_deps()
 
-    # Step 2: Clean up + start Ollama
     cleanup_old_processes()
     start_ollama()
     ensure_models()
     warmup_models()
 
-    # Step 3: Initialize Playwright DURING SETUP (not lazy)
     print("🌐 Setting up Playwright...")
     pw_ok = init_playwright()
     if not pw_ok:
         print("⚠️  Playwright failed — search won't work, but chat will.\n")
 
-    # Step 4: Start server
     threading.Thread(target=monitor, daemon=True).start()
     start_bridge()
